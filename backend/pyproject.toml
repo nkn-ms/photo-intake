@@ -1,0 +1,21 @@
+[project]
+name = "photo-intake-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "mangum",
+    "pydantic>=2",
+    "boto3",
+    "aws-lambda-powertools[tracer]",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "moto[all]", "mypy", "ruff", "httpx"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.ruff]
+line-length = 100

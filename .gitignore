@@ -1,0 +1,40 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+backend.hcl
+# .terraform.lock.hcl は意図的にコミットする。
+# provider のバージョンをチーム全員と CI で固定するためのファイルなので、
+# gitignore すると環境ごとに別バージョンが入り「手元では通るのに CI で落ちる」が起きる。
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# 環境変数・認証情報
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# 個人的なメモ・下書き・作業ログ。公開しない。
+docs/private/
+/CLAUDE.md
