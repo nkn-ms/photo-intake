@@ -41,6 +41,7 @@ destroy:         ## 作ったものを消す
 AWSP   = AWS_PROFILE=$(AWS_PROFILE) aws
 BUCKET = photo-intake-dev-uploads-$(shell $(AWSP) sts get-caller-identity --query Account --output text)
 QUEUE  = $(shell $(AWSP) sqs get-queue-url --queue-name photo-intake-dev-ingest --query QueueUrl --output text)
+DLQ    = $(shell $(AWSP) sqs get-queue-url --queue-name photo-intake-dev-ingest-dlq --query QueueUrl --output text)
 
 # ファイルを1つ置いて通知を発火させる。FILE= で差し替えられる。
 #   make upload FILE=~/Desktop/photo.jpg
@@ -52,9 +53,18 @@ upload:           ## uploads/ にファイルを置く
 # visibility-timeout を 2 にしているのは、0 だとメッセージが隠れず
 # 1回の受信で同じものが何度も返るため（＝at-least-once と冪等性の話そのもの）。
 # 2秒だけ隠して、すぐ戻す。覗くだけで消さない。
-peek:             ## キューのメッセージを覗く（消さない）
-	@aws sqs get-queue-attributes --queue-url $(QUEUE) --attribute-names ApproximateNumberOfMessages --query Attributes --output json
-	@aws sqs receive-message --queue-url $(QUEUE) --visibility-timeout 2 --max-number-of-messages 10 --output json | python3 -c "import sys,json; ms=json.load(sys.stdin).get('Messages',[]); [print(json.dumps(json.loads(m['Body']),indent=2,ensure_ascii=False)) for m in ms] or print('(メッセージなし)')"
+#
+# receive-message はメッセージが無いとき「何も出力しない」ので、
+# 空入力を JSON として読まないよう保護している。
+PEEK = python3 -c "import sys,json; d=sys.stdin.read().strip(); ms=(json.loads(d).get('Messages',[]) if d else []); [print(json.dumps(json.loads(m['Body']),indent=2,ensure_ascii=False)) for m in ms] or print('  (メッセージなし)')"
+
+peek:             ## 本体キューと DLQ の中身を覗く（消さない）
+	@echo "--- 本体キュー ---"
+	@aws sqs get-queue-attributes --queue-url $(QUEUE) --attribute-names ApproximateNumberOfMessages --query 'Attributes.ApproximateNumberOfMessages' --output text | sed 's/^/  件数: /'
+	@aws sqs receive-message --queue-url $(QUEUE) --visibility-timeout 2 --max-number-of-messages 10 --output json | $(PEEK)
+	@echo "--- DLQ ---"
+	@aws sqs get-queue-attributes --queue-url $(DLQ) --attribute-names ApproximateNumberOfMessages --query 'Attributes.ApproximateNumberOfMessages' --output text | sed 's/^/  件数: /'
+	@aws sqs receive-message --queue-url $(DLQ) --visibility-timeout 2 --max-number-of-messages 10 --output json | $(PEEK)
 
 purge:            ## キューを空にする
 	aws sqs purge-queue --queue-url $(QUEUE)

@@ -49,8 +49,29 @@ resource "aws_s3_bucket_public_access_block" "uploads" {
 #
 # バケット名と違ってアカウントIDを付けていないのは、SQS の名前が
 # 「アカウント内・リージョン内で一意」であればよいため（S3 は全世界で一意）。
+# 処理できなかったメッセージの退避先（Dead Letter Queue）。
+#
+# 捨てると失敗に気づけない。戻し続けると壊れた1件がキューを詰まらせる。
+# 「脇に避けて、後から調査できる形で残す」のが DLQ。
+resource "aws_sqs_queue" "ingest_dlq" {
+  name = "photo-intake-dev-ingest-dlq"
+
+  # 14日（SQS の上限）。調査して手を打つまでの時間を最大限確保する。
+  # 本体のキューと違い、DLQ に入ったものは急いで消す理由がない。
+  message_retention_seconds = 1209600
+}
+
 resource "aws_sqs_queue" "ingest" {
   name = "photo-intake-dev-ingest"
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.ingest_dlq.arn
+
+    # 3回受信されても消されなかったら DLQ へ移す。
+    # 「処理が完了した」= 受信側が明示的に削除した、という意味なので、
+    # 削除されずに可視性タイムアウトが切れた回数がここで数えられる。
+    maxReceiveCount = 3
+  })
 }
 
 # S3 がこのキューにメッセージを送れるようにする許可。
