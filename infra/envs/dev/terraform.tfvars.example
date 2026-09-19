@@ -1,0 +1,3 @@
+# このファイルを terraform.tfvars にコピーして、自分の値を書く。
+# terraform.tfvars は .gitignore 済み（メールアドレスを公開しないため）。
+alert_email = "you@example.com"

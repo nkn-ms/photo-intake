@@ -121,3 +121,60 @@ resource "aws_s3_bucket_notification" "uploads" {
   # このリソースはポリシーを参照していないため、Terraform は順序を推測できない。
   depends_on = [aws_sqs_queue_policy.ingest]
 }
+
+# 通知の配信先をまとめる箱（トピック）。
+#
+# アラームから直接メールを送ることはできない。必ず SNS を経由する。
+# 間に挟むことで、宛先（メール / Slack / Lambda / SMS）を後から
+# 増やしても、アラーム側を変更しなくて済む。
+resource "aws_sns_topic" "alerts" {
+  name = "photo-intake-dev-alerts"
+}
+
+# メールの購読。
+#
+# ★作成しただけでは届かない。AWS から「購読を確認してください」という
+#   メールが来るので、リンクをクリックするまで Pending 状態のまま。
+#   これは迷惑メール対策（他人のアドレスを勝手に登録できないようにするため）。
+#
+# count は「このリソースをいくつ作るか」。0 なら作らない。
+# alert_email が空のときは購読を作らず、通知なしで動くようにしている。
+resource "aws_sns_topic_subscription" "alerts_email" {
+  count = var.alert_email == "" ? 0 : 1
+
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# DLQ にメッセージが入ったら鳴らす。
+#
+# 「Lambda が落ちたらどう気づくか」への答えがこれ。
+# DLQ に退避するだけでは誰も見に行かないので、能動的に知らせる必要がある。
+resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
+  alarm_name = "photo-intake-dev-dlq-not-empty"
+
+  # 監視する対象。AWS の各サービスが自動で出しているメトリクスを指定する。
+  namespace   = "AWS/SQS"
+  metric_name = "ApproximateNumberOfMessagesVisible"
+  dimensions  = { QueueName = aws_sqs_queue.ingest_dlq.name }
+
+  # 5分ごとに、その期間の最大値を見る。
+  # Average にすると「5分のうち1分だけ1件」が 0.2 に薄まって閾値を下回るので、
+  # 「一度でも入ったか」を知りたい場合は Maximum を使う。
+  statistic          = "Maximum"
+  period             = 300
+  evaluation_periods = 1
+
+  # 0 より大きい = 1件でも入ったら鳴らす
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+
+  # SQS は静かなときメトリクスを送らないことがある。
+  # その「データ無し」を異常と見なさない（既定だと INSUFFICIENT_DATA になり紛らわしい）。
+  treat_missing_data = "notBreaching"
+
+  alarm_description = "DLQ にメッセージが入った = 3回受信しても処理されなかった"
+  alarm_actions     = [aws_sns_topic.alerts.arn]
+  ok_actions        = [aws_sns_topic.alerts.arn]
+}
