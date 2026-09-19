@@ -52,3 +52,51 @@ resource "aws_s3_bucket_public_access_block" "uploads" {
 resource "aws_sqs_queue" "ingest" {
   name = "photo-intake-dev-ingest"
 }
+
+# S3 がこのキューにメッセージを送れるようにする許可。
+#
+# SQS は「誰が送ってよいか」をキュー側で持つ（リソースベースのポリシー）。
+# 何も書かないと、このアカウントで IAM 権限を持つ人しか送れない。
+# S3 は「AWS のサービス」であって IAM ユーザーではないので、明示的に許可が要る。
+resource "aws_sqs_queue_policy" "ingest" {
+  queue_url = aws_sqs_queue.ingest.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "s3.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.ingest.arn
+
+      # 「S3 からなら何でも」ではなく「このバケットからのみ」に絞る。
+      # これが無いと、他人のアカウントの S3 バケットからもこのキューに送り込める
+      # （Confused Deputy = 権限を持つ第三者を騙して代理実行させる攻撃）。
+      Condition = {
+        ArnLike = { "aws:SourceArn" = aws_s3_bucket.uploads.arn }
+      }
+    }]
+  })
+}
+
+# バケットに「ファイルが置かれたらキューに通知する」設定を足す。
+resource "aws_s3_bucket_notification" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+
+  queue {
+    queue_arn = aws_sqs_queue.ingest.arn
+
+    # ObjectCreated:* = PUT / POST / COPY / マルチパート完了 をまとめて指す
+    events = ["s3:ObjectCreated:*"]
+
+    # uploads/ の下に置かれたものだけ。将来サムネイル等を別の場所に置いても
+    # 無限ループ（書き込み → 通知 → 書き込み）にならないようにするため。
+    filter_prefix = "uploads/"
+  }
+
+  # ★この行が無いと失敗する。
+  # S3 は通知の設定時に「本当に送れるか」テスト送信を行うので、
+  # その時点でキューのポリシーが存在していないと拒否される。
+  # このリソースはポリシーを参照していないため、Terraform は順序を推測できない。
+  depends_on = [aws_sqs_queue_policy.ingest]
+}
