@@ -311,3 +311,64 @@ resource "aws_lambda_event_source_mapping" "worker" {
   # 多いほど効率的だが、1件の失敗でバッチ全体が再配信される点に注意。
   batch_size = 10
 }
+
+# ---------------------------------------------------------------------------
+# Aurora を置くためのネットワーク（VPC）
+# ---------------------------------------------------------------------------
+#
+# Aurora は「VPC の中のサブネット」にしか置けない。だから VPC は作る。
+# ただし外と通信させる出入口（インターネットゲートウェイ / NAT ゲートウェイ）は作らない。
+#
+# Lambda からは Data API（HTTPS で SQL を送る仕組み）で DB を叩くので、
+# Lambda を VPC に入れる必要がない。VPC に入れなければ NAT Gateway（月 $45）も要らない。
+# この VPC は「DB の置き場所」としてだけ存在する。
+#
+# VPC・サブネット・セキュリティグループ・サブネットグループは、どれも無料。
+
+resource "aws_vpc" "main" {
+  # この VPC の中で使う IP アドレスの範囲。10.0.0.0〜10.0.255.255（約6.5万個）。
+  # 10.x.x.x は「プライベート用」に予約された範囲で、インターネット上には存在しない。
+  cidr_block = "10.0.0.0/16"
+
+  tags = { Name = "photo-intake-dev" }
+}
+
+# サブネット＝VPC の中の区画。1つのサブネットは必ず1つの AZ（データセンター）に属する。
+#
+# Aurora は「2つ以上の AZ にサブネットがあること」を作成の条件にしている。
+# 片方のデータセンターが止まっても、もう片方で DB を立て直せるようにするため。
+#
+# for_each は「この map の要素の数だけ作る」。ここでは2つできる。
+# （ap-northeast-1b は新しいアカウントでは使えないので、a と c を使う）
+resource "aws_subnet" "db" {
+  for_each = {
+    "ap-northeast-1a" = "10.0.1.0/24" # 10.0.1.0〜10.0.1.255
+    "ap-northeast-1c" = "10.0.2.0/24" # 10.0.2.0〜10.0.2.255
+  }
+
+  vpc_id            = aws_vpc.main.id
+  availability_zone = each.key
+  cidr_block        = each.value
+
+  tags = { Name = "photo-intake-dev-db-${each.key}" }
+}
+
+# 「Aurora はこのサブネットのどれかに置いてよい」という名簿。
+# Aurora 側はサブネットを直接指定せず、この名簿を指定する。
+resource "aws_db_subnet_group" "db" {
+  name       = "photo-intake-dev-db"
+  subnet_ids = [for s in aws_subnet.db : s.id]
+}
+
+# セキュリティグループ＝リソース単位のファイアウォール。
+#
+# ★受信（ingress）を1つも開けていない。それでも Data API では DB に繋がる。
+# Data API は AWS の内部経路で DB に届くので、ここを通らないため。
+# 「ポートを1つも開けていないのに SQL が通る」を 4c で実際に確かめる。
+resource "aws_security_group" "db" {
+  name        = "photo-intake-dev-db"
+  description = "Aurora. No ingress: accessed only via the Data API."
+  vpc_id      = aws_vpc.main.id
+
+  tags = { Name = "photo-intake-dev-db" }
+}
