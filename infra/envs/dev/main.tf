@@ -372,3 +372,76 @@ resource "aws_security_group" "db" {
 
   tags = { Name = "photo-intake-dev-db" }
 }
+
+# ---------------------------------------------------------------------------
+# Aurora Serverless v2（PostgreSQL）
+# ---------------------------------------------------------------------------
+#
+# ★ここから「置いておくだけで課金される」リソース。
+#   使わない期間は make destroy で消す。
+#
+# Aurora は「クラスター」と「インスタンス」の2段になっている。
+#   クラスター   ＝ DB の設定とデータ（ストレージ）。データはここに保存される
+#   インスタンス ＝ SQL を実際に処理する計算機。これが無いと SQL を受け付けない
+# 課金の大部分は、インスタンスが動いている時間（ACU × 時間）。
+
+resource "aws_rds_cluster" "main" {
+  cluster_identifier = "photo-intake-dev"
+
+  engine         = "aurora-postgresql"
+  engine_version = "16.14" # 東京で選べる 16 系の最新（2026-09-24 に CLI で確認）
+
+  # Serverless v2 はこの書き方になる（"serverless" は旧 v1 用で、別物）。
+  engine_mode = "provisioned"
+
+  database_name   = "photo_intake" # 最初に作られるデータベースの名前
+  master_username = "app"
+
+  # パスワードは自分で決めず、AWS に生成させて Secrets Manager に保管させる。
+  # → パスワードがコードにも state にも現れない。
+  # Data API で SQL を送るときは、この Secrets Manager の ARN を渡す。
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.db.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+
+  # ★これが Data API。HTTPS で SQL を受け付ける入口を開ける。
+  # Lambda を VPC の外に置いたまま DB を叩けるのは、これがあるから。
+  enable_http_endpoint = true
+
+  serverlessv2_scaling_configuration {
+    min_capacity             = 0   # 0 = 使っていない間は一時停止する（課金はストレージ代だけ）
+    max_capacity             = 1   # 上限。自動停止が効かなかったときの最悪額を決める
+    seconds_until_auto_pause = 300 # 最後の SQL から5分で停止。設定できる最小値
+  }
+
+  storage_encrypted = true # 保存データの暗号化。AWS 管理の鍵を使うので追加料金なし
+
+  # --- 作り直す前提の学習環境なので、消しやすくしている ---
+  # 本番ではすべて逆にする（消すのを難しくする）。
+  backup_retention_period = 1     # 自動バックアップの保持日数。1 が最小
+  skip_final_snapshot     = true  # 削除時に最後のバックアップを取らない
+  deletion_protection     = false # true だと destroy が拒否される
+}
+
+# SQL を処理する計算機を1台。
+#
+# 本番なら別の AZ にもう1台置いて、片方が止まっても切り替わるようにする。
+# 学習用なので1台だけ（2台にすると課金も2倍）。
+resource "aws_rds_cluster_instance" "main" {
+  identifier         = "photo-intake-dev-1"
+  cluster_identifier = aws_rds_cluster.main.id
+
+  instance_class = "db.serverless" # 「容量は ACU で自動伸縮」という意味
+  engine         = aws_rds_cluster.main.engine
+  engine_version = aws_rds_cluster.main.engine_version
+}
+
+# apply の最後に表示させる値。4c で CLI から SQL を送るときに使う。
+output "db_cluster_arn" {
+  value = aws_rds_cluster.main.arn
+}
+
+output "db_secret_arn" {
+  value = aws_rds_cluster.main.master_user_secret[0].secret_arn
+}
