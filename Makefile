@@ -68,3 +68,40 @@ peek:             ## 本体キューと DLQ の中身を覗く（消さない）
 
 purge:            ## キューを空にする
 	aws sqs purge-queue --queue-url $(QUEUE)
+
+# --- DB ---
+.PHONY: sql
+
+# Data API で SQL を1本送る。
+#   make sql SQL="select version()"
+# ARN は terraform output（手元の state）から取るので、ここでは AWS に触らない。
+# 一時停止中だと DatabaseResumingException が返るので、十数秒おいて打ち直す。
+SQL ?= select 1
+sql:              ## Data API で SQL を1本送る
+	aws rds-data execute-statement \
+	  --resource-arn "$$($(TF) output -raw db_cluster_arn)" \
+	  --secret-arn "$$($(TF) output -raw db_secret_arn)" \
+	  --database photo_intake \
+	  --sql "$(SQL)"
+
+# マイグレーションのファイルを、セミコロンで区切って N 番目の文だけ扱う。
+# Data API には1回に1文ずつ送る。
+#   make stmt N=2       … 2番目の文を表示するだけ（AWS に触らない）
+#   make stmt-run N=2   … 2番目の文を Data API で流す
+#
+# awk の RS=';' は「セミコロンを区切りとして、ファイルをかたまりに分ける」、
+# NR==n は「n 番目のかたまりだけ出す」という意味。
+# ※ コメントの中にセミコロンを書くと区切りがずれるので書かないこと。
+.PHONY: stmt stmt-run
+MIGRATION ?= backend/migrations/001_init.sql
+STMT = awk -v RS=';' -v n=$(N) 'NR==n' $(MIGRATION)
+
+stmt:             ## マイグレーションの N 番目の文を表示する
+	@$(STMT)
+
+stmt-run:         ## マイグレーションの N 番目の文を Data API で流す
+	aws rds-data execute-statement \
+	  --resource-arn "$$($(TF) output -raw db_cluster_arn)" \
+	  --secret-arn "$$($(TF) output -raw db_secret_arn)" \
+	  --database photo_intake \
+	  --sql "$$($(STMT))"
