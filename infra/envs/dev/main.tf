@@ -9,6 +9,11 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # data "archive_file" 用。zip を作るためだけの provider。
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
 
   # state はいまローカル（このディレクトリの terraform.tfstate）に置いている。
@@ -63,6 +68,14 @@ resource "aws_sqs_queue" "ingest_dlq" {
 
 resource "aws_sqs_queue" "ingest" {
   name = "photo-intake-dev-ingest"
+
+  # Lambda のタイムアウト（30秒）より長くする。
+  # 短いと、まだ処理中なのにメッセージが再表示され、別の実行にも配信される
+  # （＝二重処理）。AWS は関数タイムアウトの6倍を推奨しているので 30 × 6 = 180。
+  #
+  # 余裕を持たせても害は小さい。失敗したときに再配信されるまで長く待つだけで、
+  # DLQ へ落ちるまでの時間が延びるだけだから。
+  visibility_timeout_seconds = 180
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.ingest_dlq.arn
@@ -177,4 +190,124 @@ resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
   alarm_description = "DLQ にメッセージが入った = 3回受信しても処理されなかった"
   alarm_actions     = [aws_sns_topic.alerts.arn]
   ok_actions        = [aws_sns_topic.alerts.arn]
+}
+
+# ---------------------------------------------------------------------------
+# worker Lambda の IAM ロール
+# ---------------------------------------------------------------------------
+
+# 【信頼ポリシー】このロールを「誰が引き受けられるか」。
+#
+# Lambda サービスが、関数を実行するときにこのロールになりすます。
+# これが無いと AWS は「あなたにこのロールを使う資格はない」と拒否する。
+# 昨日のキューポリシーが「受け取る側の許可」だったのに対し、
+# これは「名乗る側の許可」にあたる。
+resource "aws_iam_role" "worker" {
+  name = "photo-intake-dev-worker"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole" # ロールを引き受ける、という動作そのもの
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# 【権限ポリシー その1】CloudWatch Logs への書き込み。
+#
+# AWS が用意している既製のポリシーを使う。
+# ログ出力は全 Lambda に共通で、これを自前で書く利点がない。
+resource "aws_iam_role_policy_attachment" "worker_logs" {
+  role       = aws_iam_role.worker.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# 【権限ポリシー その2】SQS からの受信。
+#
+# AWS 既製の AWSLambdaSQSQueueExecutionRole もあるが、あれは Resource が "*" で
+# 「アカウント内のすべてのキュー」を許してしまう。
+# ここは自前で書いて、このキュー1つだけに絞る（最小権限）。
+resource "aws_iam_role_policy" "worker_sqs" {
+  name = "read-ingest-queue"
+  role = aws_iam_role.worker.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "sqs:ReceiveMessage",    # メッセージを取る
+        "sqs:DeleteMessage",     # 処理できたら消す（これが無いと無限に再配信される）
+        "sqs:GetQueueAttributes" # 件数などの確認。イベントソースマッピングが使う
+      ]
+      Resource = aws_sqs_queue.ingest.arn # ★このキューだけ
+    }]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# worker Lambda 本体
+# ---------------------------------------------------------------------------
+
+# Python のファイルを zip に固める。
+# Terraform に同梱されている archive provider の機能で、外部ツールは要らない。
+#
+# いまは外部ライブラリを使っていないのでこれで足りる。
+# 依存が増えたら terraform-aws-modules/lambda/aws か Lambda Layer に切り替える。
+data "archive_file" "worker" {
+  type        = "zip"
+  source_file = "${path.module}/../../../backend/worker/handler.py"
+  output_path = "${path.module}/.build/worker.zip"
+}
+
+# ログの置き場を先に作る。
+#
+# 作らなくても Lambda が自動で作るが、その場合「保持期間＝無期限」になり
+# ログが永遠に溜まって課金され続ける。明示的に作って期限を付ける。
+# 名前は /aws/lambda/<関数名> でなければならない（AWS の規約）。
+resource "aws_cloudwatch_log_group" "worker" {
+  name              = "/aws/lambda/photo-intake-dev-worker"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "worker" {
+  function_name = "photo-intake-dev-worker"
+  role          = aws_iam_role.worker.arn
+
+  filename = data.archive_file.worker.output_path
+
+  # zip の中身が変わったときだけ再デプロイさせるための指紋。
+  # これが無いと、コードを書き換えても Terraform が気づかない。
+  source_code_hash = data.archive_file.worker.output_base64sha256
+
+  runtime = "python3.12"
+  handler = "handler.handler" # <ファイル名>.<関数名>
+
+  timeout     = 30
+  memory_size = 256
+
+  environment {
+    variables = {
+      LOG_LEVEL = "INFO"
+    }
+  }
+
+  # ロググループを先に作らせる。参照していないので明示が必要。
+  depends_on = [aws_cloudwatch_log_group.worker]
+}
+
+# 「このキューにメッセージが来たら、この関数を起動する」という紐付け。
+#
+# Lambda が SQS を見に行く（ポーリングする）形になる。
+# S3 → Lambda を直接繋ぐこともできるが、それだと失敗時のリトライと
+# DLQ を自前で用意することになる。SQS を挟んでいるのはそのため。
+resource "aws_lambda_event_source_mapping" "worker" {
+  event_source_arn = aws_sqs_queue.ingest.arn
+  function_name    = aws_lambda_function.worker.arn
+
+  # 1回の呼び出しで最大何件まとめて渡すか。
+  # 多いほど効率的だが、1件の失敗でバッチ全体が再配信される点に注意。
+  batch_size = 10
 }

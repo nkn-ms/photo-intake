@@ -6,6 +6,8 @@ crash.log
 *.tfvars
 !*.tfvars.example
 backend.hcl
+# archive_file が生成する Lambda の zip。ソース（backend/）から毎回作り直せる生成物。
+.build/
 # .terraform.lock.hcl は意図的にコミットする。
 # provider のバージョンをチーム全員と CI で固定するためのファイルなので、
 # gitignore すると環境ごとに別バージョンが入り「手元では通るのに CI で落ちる」が起きる。
