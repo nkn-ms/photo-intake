@@ -105,3 +105,32 @@ stmt-run:         ## マイグレーションの N 番目の文を Data API で�
 	  --secret-arn "$$($(TF) output -raw db_secret_arn)" \
 	  --database photo_intake \
 	  --sql "$$($(STMT))"
+
+# マイグレーションの文を 1 番から順にすべて流す。空の DB に1回だけ流す前提。
+#
+# ① まず DB を起こす。一時停止中は DatabaseResumingException が返るので、
+#    select 1 が通るまで10秒おきに打ち直す（一度起きれば5分は止まらない）。
+#    上限は12回（約2分）。ログイン切れや apply 忘れだと何回打っても通らないので、
+#    上限なしだと何も表示されないまま永遠に待つことになる。
+#    待っている間の出力は捨てる（>/dev/null 2>&1）。12回目に失敗したときだけ、
+#    捨てずにもう一度 select 1 を送って、本当の理由を画面に出す。
+# ② 起きてから文を順に流す。どれか1つでも失敗したらそこで止まる。
+#    ここは打ち直さない。SQL の書き間違いだと永遠に終わらなくなるため。
+#
+# ※ 途中で失敗すると、それまでに作ったものは残る（トランザクションにしていない）。
+#   dev なら make destroy → make apply で作り直せばよい。
+# 文の数は awk で数える（NF は「空白以外の中身があるかたまり」だけを数えるため）。
+.PHONY: migrate
+migrate:          ## マイグレーションの文をすべて順に流す
+	@echo "--- DB を起こす（止まっていたら起きるまで待つ）"
+	@for i in $$(seq 1 12); do \
+	  $(MAKE) -s sql SQL="select 1" >/dev/null 2>&1 && break; \
+	  [ $$i -eq 12 ] && { echo "DB に繋がらない。最後のエラー："; $(MAKE) -s sql; exit 1; }; \
+	  echo "  起動を待っています… ($$i/12)"; sleep 10; \
+	done
+	@total=$$(awk -v RS=';' 'NF{c++} END{print c}' $(MIGRATION)); \
+	for n in $$(seq 1 $$total); do \
+	  echo "--- 文 $$n/$$total"; \
+	  $(MAKE) -s stmt-run N=$$n || exit 1; \
+	done; \
+	echo "--- 完了：$(MIGRATION) の文 $$total 個をすべて流した"
