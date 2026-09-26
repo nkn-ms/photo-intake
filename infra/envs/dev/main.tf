@@ -247,6 +247,64 @@ resource "aws_iam_role_policy" "worker_sqs" {
   })
 }
 
+# 【権限ポリシー その3】S3 から写真を読む。
+#
+# 通知に入っているのは「どのファイルか」だけで、写真そのものは入っていない。
+# worker が自分で取りに行くので、読む権限が要る。
+# uploads/ の下だけに絞る（通知の filter_prefix と同じ範囲）。
+resource "aws_iam_role_policy" "worker_s3" {
+  name = "read-uploads"
+  role = aws_iam_role.worker.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:GetObject"
+      Resource = "${aws_s3_bucket.uploads.arn}/uploads/*"
+    }]
+  })
+}
+
+# 【権限ポリシー その4】Bedrock のモデルを呼ぶ。
+#
+# 写真を解析するモデルは推論プロファイル（jp.）経由でしか呼べない。
+# このとき AWS は2段階で権限を確かめる:
+#   ① 推論プロファイルを使ってよいか      … 東京にある「振り分け係」
+#   ② 振り分け先のモデル本体を使ってよいか … 東京・大阪の両方
+# ②が片方でも欠けると「大阪に振られたときだけ失敗する」という再現しにくい障害になる。
+#
+# 埋め込み（Titan）は東京で直接呼べるので、モデル本体1つでよい。
+#
+# モデル本体の ARN はアカウントIDの欄が空（::）。AWS が持っているもので、
+# 自分のアカウントのものではないため。
+locals {
+  bedrock_regions = ["ap-northeast-1", "ap-northeast-3"] # jp. の送信先（東京・大阪）
+  embed_model_id  = "amazon.titan-embed-text-v2:0"
+}
+
+resource "aws_iam_role_policy" "worker_bedrock" {
+  name = "invoke-bedrock"
+  role = aws_iam_role.worker.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      # Converse API で呼ぶときも、必要な権限は InvokeModel（Converse という権限は無い）
+      Action = "bedrock:InvokeModel"
+      Resource = concat(
+        # ① 推論プロファイル
+        ["arn:aws:bedrock:ap-northeast-1:${data.aws_caller_identity.current.account_id}:inference-profile/jp.${var.vision_model_id}"],
+        # ② 送信先のモデル本体（リージョンの数だけ作る）
+        [for r in local.bedrock_regions : "arn:aws:bedrock:${r}::foundation-model/${var.vision_model_id}"],
+        # 埋め込み
+        ["arn:aws:bedrock:ap-northeast-1::foundation-model/${local.embed_model_id}"],
+      )
+    }]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # worker Lambda 本体
 # ---------------------------------------------------------------------------

@@ -14,3 +14,14 @@ variable "alert_email" {
   # ここでは「未設定なら通知なしで動く」ようにしたいので空文字を既定にする。
   default = ""
 }
+
+variable "vision_model_id" {
+  type        = string
+  description = "写真を解析するモデル（Bedrock のモデルID。jp. は付けない）"
+
+  # 本命は Claude（anthropic.claude-haiku-4-5-20251001-v1:0）。
+  # Anthropic の利用申請がサポート待ちなので、それまで Nova 2 Lite を代役にする。
+  # どちらも「jp. の推論プロファイル経由・送信先は東京と大阪」で形が同じなので、
+  # 承認されたらこの1行を変えるだけで差し替わる。
+  default = "amazon.nova-2-lite-v1:0"
+}
