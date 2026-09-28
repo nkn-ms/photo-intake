@@ -320,6 +320,37 @@ resource "aws_iam_role_policy" "worker_bedrock" {
   })
 }
 
+# 【権限ポリシー その5】Data API で DB に SQL を送る。
+#
+# 2つそろって初めて SQL が通る:
+#   ・rds-data:ExecuteStatement   … このクラスターの Data API に SQL を送ってよい
+#   ・secretsmanager:GetSecretValue … DB のパスワードが入ったシークレットを使ってよい
+# パスワードそのものは worker に渡らない。worker が渡すのはシークレットの ARN だけで、
+# 中身を取り出して DB にログインするのは Data API。ただし「使ってよいか」は呼んだ側の権限で判定される。
+#
+# aws_rds_cluster.main はこのファイルの後ろのほうで定義しているが、Terraform は書いた順番を気にしない。
+# 参照から作る順番を決めるので、クラスターができてからこのポリシーが作られる。
+resource "aws_iam_role_policy" "worker_db" {
+  name = "query-db"               # ポリシーの名前
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "rds-data:ExecuteStatement"
+        Resource = aws_rds_cluster.main.arn # ★このクラスターだけ
+      },
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = aws_rds_cluster.main.master_user_secret[0].secret_arn # ★このシークレットだけ
+      },
+    ]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # worker Lambda 本体
 # ---------------------------------------------------------------------------
@@ -371,6 +402,12 @@ resource "aws_lambda_function" "worker" {
 
       # bedrock / dummy の切り替え。variables.tf の analyzer を参照
       ANALYZER = var.analyzer
+
+      # Data API に渡す3点セット（make sql と同じもの）。
+      # ARN は「置き場所」であって秘密ではないので、環境変数に入れてよい。
+      DB_CLUSTER_ARN = aws_rds_cluster.main.arn
+      DB_SECRET_ARN  = aws_rds_cluster.main.master_user_secret[0].secret_arn
+      DB_NAME        = aws_rds_cluster.main.database_name
     }
   }
 

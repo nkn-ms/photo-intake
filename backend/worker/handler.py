@@ -18,6 +18,12 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 # Lambda は同じ実行環境を使い回すので、2回目以降の呼び出しでは作り直さずに済む。
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime")
+rds_data = boto3.client("rds-data")  # Data API（HTTPS で SQL を送る）
+
+# Data API に渡す3点セット。make sql が --resource-arn / --secret-arn / --database で渡しているのと同じもの。
+DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
+DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+DB_NAME = os.environ["DB_NAME"]
 
 # 推論プロファイルのID（jp. 付き）。Terraform が環境変数で渡す。
 # jp. の付かないモデルIDを渡すと、Nova 2 Lite も Claude も「直接は呼べない」と失敗する。
@@ -26,6 +32,9 @@ VISION_MODEL_ID = os.environ["VISION_MODEL_ID"]
 # "bedrock" なら本物のモデルを呼ぶ。"dummy" なら呼ばずに決め打ちの答えを返す。
 # アカウントで Bedrock が止められている間（サポート待ち）も、保存の流れを先に作るため。
 ANALYZER = os.environ.get("ANALYZER", "bedrock")
+
+# items.ai_model に記録する名前。ダミーの行を後から見分けて、精度の集計から外せるようにする。
+AI_MODEL = "dummy" if ANALYZER == "dummy" else VISION_MODEL_ID
 
 # ダミーの答え。本物のモデルに頼んでいるのと同じ形にしておく。
 DUMMY_ANSWER = json.dumps(
@@ -103,6 +112,56 @@ def analyze(bucket: str, key: str) -> None:
 
     answer = ask_model(image_bytes, image_format)
     logger.info("model answer: %s", answer)
+
+    # JSON として読めるかをここで確かめる。読めなければ例外 → SQS が渡し直す → 3回で DLQ。
+    # （本物のモデルは ```json で囲んで返すことがある。その扱いは Bedrock が使えるようになってから決める）
+    ai_result = json.loads(answer)
+    save_result(key, ai_result)
+
+
+# 行は API（ステップ8）が署名付きURLを発行するときに作る。worker は UPDATE だけを担当する。
+# API ができるまでは make sql で手で INSERT しておく。
+#
+# status = 'analyzing' を条件に入れているので、次の2つの場合は1行も更新されない:
+#   ・行が無い（登録されていない写真）
+#   ・もう解析済み（SQS の2回目の配信）→ 人が確認した後の結果を上書きしないで済む
+#
+# :名前 はパラメータ。値は SQL の文字列に埋め込まず、parameters で別に渡す（SQL インジェクション対策）。
+UPDATE_SQL = """
+update items
+   set status         = 'pending_review',
+       ai_result      = :ai_result,
+       ai_model       = :ai_model,
+       ai_analyzed_at = now(),
+       updated_at     = now()
+ where s3_key = :s3_key
+   and status = 'analyzing'
+"""
+
+
+def save_result(key: str, ai_result: dict) -> None:
+    """AI の答えを items に保存して、status を pending_review に進める。"""
+    response = rds_data.execute_statement(
+        resourceArn=DB_CLUSTER_ARN,
+        secretArn=DB_SECRET_ARN,
+        database=DB_NAME,
+        sql=UPDATE_SQL,
+        parameters=[
+            # typeHint="JSON"：文字列として渡すが、DB 側では jsonb として扱ってもらう
+            {
+                "name": "ai_result",
+                "value": {"stringValue": json.dumps(ai_result, ensure_ascii=False)},
+                "typeHint": "JSON",
+            },
+            {"name": "ai_model", "value": {"stringValue": AI_MODEL}},
+            {"name": "s3_key", "value": {"stringValue": key}},
+        ],
+    )
+
+    if response["numberOfRecordsUpdated"] == 0:
+        logger.warning("no row updated (未登録の写真か、解析済み): %s", key)
+    else:
+        logger.info("saved: %s -> pending_review", key)
 
 
 def ask_model(image_bytes: bytes, image_format: str) -> str:
