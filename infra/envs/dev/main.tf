@@ -195,6 +195,19 @@ resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
 # ---------------------------------------------------------------------------
 # worker Lambda の IAM ロール
 # ---------------------------------------------------------------------------
+#
+# ロールには性格の違う2種類のポリシーが付く。両方そろって初めて動く。
+#
+#   信頼ポリシー … 「誰が」このロールを引き受けられるか（→ Lambda サービス）
+#                   ロール本体（aws_iam_role）の中に書く。コンソールでは「信頼関係」タブ。
+#                   Principal（誰に）を書く＝リソースベースのポリシー。
+#   権限ポリシー … このロールを引き受けた者が「何をできるか」（→ ログ・SQS・S3・Bedrock）
+#                   ロールとは別のブロックで書き、role = で「どのロールに与えるか」を指す。
+#                   コンソールでは「許可」タブ。Principal は書かない＝アイデンティティベース。
+#
+# 関数との関係：aws_lambda_function.worker の role = でこのロールを指定する。
+# 実行のたびに Lambda サービスがこのロールを引き受け、一時的な鍵を関数に渡す。
+# だから handler.py にはアクセスキーが1つも出てこない。
 
 # 【信頼ポリシー】このロールを「誰が引き受けられるか」。
 #
@@ -203,8 +216,9 @@ resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
 # 昨日のキューポリシーが「受け取る側の許可」だったのに対し、
 # これは「名乗る側の許可」にあたる。
 resource "aws_iam_role" "worker" {
-  name = "photo-intake-dev-worker"
+  name = "photo-intake-dev-worker" # ロールの名前（AWS 上の名前）
 
+  # 信頼ポリシー：このロールを lambda.amazonaws.com（Lambda サービス）が引き受けてよい
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -219,8 +233,9 @@ resource "aws_iam_role" "worker" {
 #
 # AWS が用意している既製のポリシーを使う。
 # ログ出力は全 Lambda に共通で、これを自前で書く利点がない。
+# 既製のポリシーは「付ける」だけなので、ポリシーの名前（name）は書かない。
 resource "aws_iam_role_policy_attachment" "worker_logs" {
-  role       = aws_iam_role.worker.name
+  role       = aws_iam_role.worker.name # このロールに与える
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
@@ -230,8 +245,8 @@ resource "aws_iam_role_policy_attachment" "worker_logs" {
 # 「アカウント内のすべてのキュー」を許してしまう。
 # ここは自前で書いて、このキュー1つだけに絞る（最小権限）。
 resource "aws_iam_role_policy" "worker_sqs" {
-  name = "read-ingest-queue"
-  role = aws_iam_role.worker.id
+  name = "read-ingest-queue"      # ポリシーの名前（ロールの名前ではない）
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -253,8 +268,8 @@ resource "aws_iam_role_policy" "worker_sqs" {
 # worker が自分で取りに行くので、読む権限が要る。
 # uploads/ の下だけに絞る（通知の filter_prefix と同じ範囲）。
 resource "aws_iam_role_policy" "worker_s3" {
-  name = "read-uploads"
-  role = aws_iam_role.worker.id
+  name = "read-uploads"           # ポリシーの名前
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -284,8 +299,8 @@ locals {
 }
 
 resource "aws_iam_role_policy" "worker_bedrock" {
-  name = "invoke-bedrock"
-  role = aws_iam_role.worker.id
+  name = "invoke-bedrock"         # ポリシーの名前
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -332,7 +347,7 @@ resource "aws_cloudwatch_log_group" "worker" {
 
 resource "aws_lambda_function" "worker" {
   function_name = "photo-intake-dev-worker"
-  role          = aws_iam_role.worker.arn
+  role          = aws_iam_role.worker.arn # この関数はこのロールで動く（Lambda の API は ARN で受け取る）
 
   filename = data.archive_file.worker.output_path
 
