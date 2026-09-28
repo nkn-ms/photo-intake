@@ -364,6 +364,10 @@ resource "aws_lambda_function" "worker" {
   environment {
     variables = {
       LOG_LEVEL = "INFO"
+
+      # 推論プロファイルのID（jp. 付き）。IAM の ① と同じものを指す。
+      # handler.py は os.environ["VISION_MODEL_ID"] で読むので、これが無いと起動時に落ちる。
+      VISION_MODEL_ID = "jp.${var.vision_model_id}"
     }
   }
 
