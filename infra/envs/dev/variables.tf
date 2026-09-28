@@ -25,3 +25,18 @@ variable "vision_model_id" {
   # 承認されたらこの1行を変えるだけで差し替わる。
   default = "amazon.nova-2-lite-v1:0"
 }
+
+variable "analyzer" {
+  type        = string
+  description = "bedrock なら本物のモデルを呼ぶ。dummy なら呼ばずに決め打ちの答えを返す"
+
+  # このアカウントでは Bedrock のモデル呼び出しが止められている（サポート待ち）。
+  # それまで dummy で保存の流れを作り、解除されたら bedrock に戻す。
+  default = "dummy"
+
+  # 決まった値以外を渡したら、plan の時点で止める（打ち間違いを apply まで持ち込まない）
+  validation {
+    condition     = contains(["bedrock", "dummy"], var.analyzer)
+    error_message = "analyzer は bedrock か dummy のどちらか。"
+  }
+}

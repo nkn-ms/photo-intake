@@ -23,6 +23,21 @@ bedrock = boto3.client("bedrock-runtime")
 # jp. の付かないモデルIDを渡すと、Nova 2 Lite も Claude も「直接は呼べない」と失敗する。
 VISION_MODEL_ID = os.environ["VISION_MODEL_ID"]
 
+# "bedrock" なら本物のモデルを呼ぶ。"dummy" なら呼ばずに決め打ちの答えを返す。
+# アカウントで Bedrock が止められている間（サポート待ち）も、保存の流れを先に作るため。
+ANALYZER = os.environ.get("ANALYZER", "bedrock")
+
+# ダミーの答え。本物のモデルに頼んでいるのと同じ形にしておく。
+DUMMY_ANSWER = json.dumps(
+    {
+        "category": "財布",
+        "color": "黒",
+        "brand": None,
+        "features": ["二つ折り", "革製", "角に擦れ"],
+    },
+    ensure_ascii=False,  # 日本語を 財 のような形にせず、そのまま出す
+)
+
 # 拡張子 → Converse API の format。
 # format に "jpg" という値は無い（"jpeg" だけ）。Playground で JPG を選べなかったのと同じ種類の落とし穴。
 IMAGE_FORMATS = {
@@ -86,6 +101,16 @@ def analyze(bucket: str, key: str) -> None:
     image_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     logger.info("downloaded s3://%s/%s (%d bytes)", bucket, key, len(image_bytes))
 
+    answer = ask_model(image_bytes, image_format)
+    logger.info("model answer: %s", answer)
+
+
+def ask_model(image_bytes: bytes, image_format: str) -> str:
+    """写真をモデルに渡して、答え（文字列）を返す。"""
+    if ANALYZER == "dummy":
+        logger.info("ANALYZER=dummy: Bedrock は呼ばずに決め打ちの答えを返す")
+        return DUMMY_ANSWER
+
     # Converse API：モデルが変わっても同じ形で呼べる
     response = bedrock.converse(
         modelId=VISION_MODEL_ID,
@@ -102,10 +127,8 @@ def analyze(bucket: str, key: str) -> None:
         inferenceConfig={"maxTokens": 512, "temperature": 0},
     )
 
-    answer = response["output"]["message"]["content"][0]["text"]
     usage = response["usage"]  # 入出力のトークン数。料金はこれで決まる
-
-    logger.info("model answer: %s", answer)
     logger.info(
         "tokens: input=%d output=%d", usage["inputTokens"], usage["outputTokens"]
     )
+    return response["output"]["message"]["content"][0]["text"]
