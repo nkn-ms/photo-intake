@@ -446,9 +446,18 @@ resource "aws_lambda_event_source_mapping" "worker" {
   event_source_arn = aws_sqs_queue.ingest.arn
   function_name    = aws_lambda_function.worker.arn
 
-  # 1回の呼び出しで最大何件まとめて渡すか。
-  # 多いほど効率的だが、1件の失敗でバッチ全体が再配信される点に注意。
-  batch_size = 10
+  # 1回の呼び出しで最大何件まとめて渡すか。1件ずつにしている。
+  #
+  # 10件まとめると、次の2つが起きる:
+  #   ・巻き添え：1件が一時的なエラーで raise すると、成功した9件も含めて10件すべてが渡し直される。
+  #     9件も受け取った回数が1つ増えるので、最終試行で analysis_failed にされることがある
+  #   ・タイムアウト：worker は1件ずつ順番に処理する。Bedrock が1件5秒かかると、10件で 60秒に届く
+  #
+  # 代わりに、写真が一度にたくさん来ると同時に動く worker の台数が増える（Bedrock の混雑を招きやすい）。
+  # そうなったら maximum_concurrency（同時に動かす台数の上限）を足す。
+  # 失敗した分だけを返す「部分的なバッチ応答」（ReportBatchItemFailures）で巻き添えは防げるが、
+  # タイムアウトは防げないので採らなかった。
+  batch_size = 1
 }
 
 # ---------------------------------------------------------------------------
