@@ -66,6 +66,18 @@ resource "aws_sqs_queue" "ingest_dlq" {
   message_retention_seconds = 1209600
 }
 
+# 何回渡しても処理できなかったら DLQ に移すか。
+#
+# この数は2か所で使う：本体キューの maxReceiveCount と、worker の環境変数 MAX_RECEIVE_COUNT。
+# worker は「この回数目の配信が最終試行」と判断して analysis_failed を書くので、
+# 2つがずれると、書くべき回に書かない（または早すぎる回に書く）。
+# 数字を2か所に直接書くと片方だけ変えてしまうので、ここに1回だけ書いて両方から参照する。
+#
+# locals は1つのファイルにいくつ書いてもよい。使う場所の近くに置いている。
+locals {
+  max_receive_count = 3
+}
+
 resource "aws_sqs_queue" "ingest" {
   name = "photo-intake-dev-ingest"
 
@@ -83,7 +95,7 @@ resource "aws_sqs_queue" "ingest" {
     # 3回受信されても消されなかったら DLQ へ移す。
     # 「処理が完了した」= 受信側が明示的に削除した、という意味なので、
     # 削除されずに可視性タイムアウトが切れた回数がここで数えられる。
-    maxReceiveCount = 3
+    maxReceiveCount = local.max_receive_count
   })
 }
 
@@ -408,6 +420,10 @@ resource "aws_lambda_function" "worker" {
       DB_CLUSTER_ARN = aws_rds_cluster.main.arn
       DB_SECRET_ARN  = aws_rds_cluster.main.master_user_secret[0].secret_arn
       DB_NAME        = aws_rds_cluster.main.database_name
+
+      # 本体キューの maxReceiveCount と同じ数（上の locals）。
+      # 環境変数は文字列しか入らないので tostring で "3" にする。handler.py 側で int に戻す。
+      MAX_RECEIVE_COUNT = tostring(local.max_receive_count)
     }
   }
 

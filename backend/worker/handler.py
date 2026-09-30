@@ -32,6 +32,10 @@ DB_NAME = os.environ["DB_NAME"]
 # jp. の付かないモデルIDを渡すと、Nova 2 Lite も Claude も「直接は呼べない」と失敗する。
 VISION_MODEL_ID = os.environ["VISION_MODEL_ID"]
 
+# 本体キューの maxReceiveCount と同じ数。Terraform が同じ locals から渡す。
+# この回数目の配信で失敗したら、次は DLQ に落ちる＝最終試行。
+MAX_RECEIVE_COUNT = int(os.environ["MAX_RECEIVE_COUNT"])
+
 # "bedrock" なら本物のモデルを呼ぶ。"dummy" なら呼ばずに決め打ちの答えを返す。
 # アカウントで Bedrock が止められている間（サポート待ち）も、保存の流れを先に作るため。
 ANALYZER = os.environ.get("ANALYZER", "bedrock")
@@ -72,7 +76,7 @@ PROMPT = """この写真は、施設で拾われた落とし物です。
 class PermanentError(Exception):
     """何度やり直しても同じ結果になる失敗。
 
-    これを投げると、handler が受け止めて analysis_failed を書く。
+    handler がこれを捕まえたら、やり直さずに処理を止めて analysis_failed を書く。
     SQS には「成功した」と返すので、渡し直し（3分×3回の無駄）が起きない。
     """
 
@@ -91,6 +95,9 @@ def handler(event, context):
     for record in event.get("Records", []):
         body = json.loads(record["body"])
 
+        # このメッセージが何回目の配信か。SQS は数字を文字列で入れてくる
+        receive_count = int(record["attributes"]["ApproximateReceiveCount"])
+
         # S3 のテスト通知（バケット設定時に送られる）には Records が無い
         if "Records" not in body:
             logger.info("skipped non-s3 event: %s", body.get("Event", "unknown"))
@@ -104,10 +111,47 @@ def handler(event, context):
             try:
                 analyze(bucket, key)
             except PermanentError as e:
-                # ここで受け止めるので、例外は handler の外に出ない＝SQS はメッセージを消す。
-                # PermanentError 以外（一時的な失敗）は受け止めずに外へ出す＝SQS が渡し直す。
+                # 恒久的なエラー。やり直しても同じなので、ここで処理を止める。
+                # 失敗を DB に書いて正常に終わるので、SQS はメッセージを消す（やり直しは起きない）。
                 logger.warning("analysis failed: %s: %s", key, e)
                 mark_failed(key, str(e))
+            except Exception as e:
+                # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）。時間をおいて処理をやり直す。
+                # 例外を投げ直す（raise）と、SQS はメッセージを消さずに、少し後でもう一度渡してくれる。
+                #
+                # SQS は同じメッセージを MAX_RECEIVE_COUNT 回（3回）まで渡してくれる:
+                #    0分  1回目 失敗 → raise → SQS「3分後にもう一度」
+                #    3分  2回目 失敗 → raise → SQS「3分後にもう一度」
+                #    6分  3回目 失敗 → raise → SQS「もう諦める。DLQ へ」
+                # 3回目が「最終試行」（DLQ に移る前の最後の配信）。これより後に worker が呼ばれることはない。
+                #
+                # ■ なぜ最終試行で analysis_failed を書くのか
+                #   DLQ と DB は見る人が違う。
+                #     ・DLQ … 開発者が見る（アラームのメールで気づく）
+                #     ・DB  … スタッフが管理画面で見る。画面は DLQ を読まない
+                #   書かずに DLQ へ落ちると、画面には analyzing（解析中）が出続け、
+                #   「待てば終わるのか、もう終わらないのか」がスタッフに分からない。
+                #   手入力に回すボタンも analysis_failed の行にしか出ない。
+                #
+                # ■ なぜ1回目・2回目では書かないのか
+                #   次の配信で成功するかもしれないから。先に analysis_failed を書くと、
+                #   次の配信で成功しても save_result の条件（status = 'analyzing'）に合わず、
+                #   成功が保存されないまま失敗として残ってしまう。
+                if receive_count >= MAX_RECEIVE_COUNT:
+                    logger.error("giving up after %d attempts: %s", receive_count, key)
+                    mark_failed(
+                        key,
+                        f"{receive_count}回試して失敗: {type(e).__name__}: {e}",
+                    )
+
+                # ■ なぜ最終試行でも raise するのか（恒久的なエラーのように、ここで処理を止めない）
+                #   raise すると DLQ に入り、アラームが開発者にメールする。
+                #   一時的な失敗が3回続いた＝写真1枚ではなく「仕組み」が壊れている疑いがあるので、
+                #   スタッフの画面だけでなく開発者にも知らせたい。
+                #   （恒久的なエラーは写真1枚の問題なので、上の except で処理を止めて画面だけにしている）
+                #
+                # 引数なしの raise は「いま捕まえた例外をそのまま投げ直す」。TS の throw e と同じ。
+                raise
 
     # 正常終了すると、Lambda が SQS のメッセージを自動で削除する。
     # 例外を投げると削除されず、可視性タイムアウト後に再配信される。
@@ -241,7 +285,7 @@ def ask_model(image_bytes: bytes, image_format: str) -> str:
     except bedrock.exceptions.ValidationException as e:
         # ValidationException は「送った中身が受け付けられない」という意味（画像が大きすぎる、など）。
         # 同じ中身を送り直しても通らないので恒久的な失敗。
-        # ThrottlingException（混雑）などはここで受け止めず、外へ出して SQS に渡し直させる。
+        # ThrottlingException（混雑）などはここでは捕まえない。一時的なエラーとして SQS にやり直してもらう。
         raise PermanentError(f"Bedrock が受け付けなかった: {e}")
 
     usage = response["usage"]  # 入出力のトークン数。料金はこれで決まる
