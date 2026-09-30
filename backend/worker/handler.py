@@ -1,7 +1,10 @@
 """SQS から S3 のイベントを受け取る worker。
 
-このステップでは、写真を Bedrock のモデルに渡して、返ってきた答えをログに出すだけ。
-DB への保存は後のステップで足す（先に「AI が何を返すか」を目で見てから保存の形を決める）。
+写真を Bedrock のモデルに渡し、返ってきた答えを items に保存する。
+
+失敗は2種類に分けて扱う:
+  ・恒久的な失敗（何度やっても同じ）→ その場で analysis_failed にする。例外は投げない
+  ・一時的な失敗（時間をおけば通るかも）→ 例外を投げて SQS に渡し直させる
 """
 
 import json
@@ -66,6 +69,14 @@ PROMPT = """この写真は、施設で拾われた落とし物です。
  "features": ["目立つ特徴を短く。最大5つ"]}"""
 
 
+class PermanentError(Exception):
+    """何度やり直しても同じ結果になる失敗。
+
+    これを投げると、handler が受け止めて analysis_failed を書く。
+    SQS には「成功した」と返すので、渡し直し（3分×3回の無駄）が起きない。
+    """
+
+
 def handler(event, context):
     """Lambda のエントリポイント。
 
@@ -90,7 +101,13 @@ def handler(event, context):
             # S3 の通知に入るキーは URL エンコードされている（空白は +、日本語は %E3%81... になる）。
             # そのまま get_object に渡すと「そんなファイルは無い」と言われるので、元に戻す。
             key = unquote_plus(s3_event["s3"]["object"]["key"])
-            analyze(bucket, key)
+            try:
+                analyze(bucket, key)
+            except PermanentError as e:
+                # ここで受け止めるので、例外は handler の外に出ない＝SQS はメッセージを消す。
+                # PermanentError 以外（一時的な失敗）は受け止めずに外へ出す＝SQS が渡し直す。
+                logger.warning("analysis failed: %s: %s", key, e)
+                mark_failed(key, str(e))
 
     # 正常終了すると、Lambda が SQS のメッセージを自動で削除する。
     # 例外を投げると削除されず、可視性タイムアウト後に再配信される。
@@ -102,9 +119,7 @@ def analyze(bucket: str, key: str) -> None:
     ext = os.path.splitext(key)[1].lower()
     image_format = IMAGE_FORMATS.get(ext)
     if image_format is None:
-        # 失敗の扱い（analysis_failed）は後のステップで決める。いまはログだけ。
-        logger.warning("unsupported file type, skipped: %s", key)
-        return
+        raise PermanentError(f"未対応の形式: {ext or '(拡張子なし)'}")
 
     # 通知には「どのファイルか」しか入っていないので、写真そのものを取りに行く
     image_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -113,9 +128,13 @@ def analyze(bucket: str, key: str) -> None:
     answer = ask_model(image_bytes, image_format)
     logger.info("model answer: %s", answer)
 
-    # JSON として読めるかをここで確かめる。読めなければ例外 → SQS が渡し直す → 3回で DLQ。
+    # 同じ写真・同じ temperature=0 で渡し直しても、同じ答えが返ってくるだけなので恒久的な失敗。
     # （本物のモデルは ```json で囲んで返すことがある。その扱いは Bedrock が使えるようになってから決める）
-    ai_result = json.loads(answer)
+    try:
+        ai_result = json.loads(answer)
+    except json.JSONDecodeError:
+        # 答えの頭だけを残す。人が画面で見て「なぜ失敗したか」が分かるように
+        raise PermanentError(f"モデルの答えが JSON として読めない: {answer[:200]}")
     save_result(key, ai_result)
 
 
@@ -164,6 +183,39 @@ def save_result(key: str, ai_result: dict) -> None:
         logger.info("saved: %s -> pending_review", key)
 
 
+# 条件は UPDATE_SQL と同じ（status = 'analyzing' のときだけ）。
+# ai_model も残すのは、「どのモデルが JSON を返し損ねたか」を後で数えられるようにするため。
+FAIL_SQL = """
+update items
+   set status     = 'analysis_failed',
+       ai_error   = :ai_error,
+       ai_model   = :ai_model,
+       updated_at = now()
+ where s3_key = :s3_key
+   and status = 'analyzing'
+"""
+
+
+def mark_failed(key: str, reason: str) -> None:
+    """解析をあきらめたことを items に記録する。画面から手入力に回せるようにするため。"""
+    response = rds_data.execute_statement(
+        resourceArn=DB_CLUSTER_ARN,
+        secretArn=DB_SECRET_ARN,
+        database=DB_NAME,
+        sql=FAIL_SQL,
+        parameters=[
+            {"name": "ai_error", "value": {"stringValue": reason}},
+            {"name": "ai_model", "value": {"stringValue": AI_MODEL}},
+            {"name": "s3_key", "value": {"stringValue": key}},
+        ],
+    )
+
+    if response["numberOfRecordsUpdated"] == 0:
+        logger.warning("no row updated (未登録の写真か、解析済み): %s", key)
+    else:
+        logger.info("saved: %s -> analysis_failed", key)
+
+
 def ask_model(image_bytes: bytes, image_format: str) -> str:
     """写真をモデルに渡して、答え（文字列）を返す。"""
     if ANALYZER == "dummy":
@@ -171,20 +223,26 @@ def ask_model(image_bytes: bytes, image_format: str) -> str:
         return DUMMY_ANSWER
 
     # Converse API：モデルが変わっても同じ形で呼べる
-    response = bedrock.converse(
-        modelId=VISION_MODEL_ID,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
-                    {"text": PROMPT},
-                ],
-            }
-        ],
-        # temperature=0：毎回なるべく同じ答えにする（抽出の作業なので、創造性は要らない）
-        inferenceConfig={"maxTokens": 512, "temperature": 0},
-    )
+    try:
+        response = bedrock.converse(
+            modelId=VISION_MODEL_ID,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
+                        {"text": PROMPT},
+                    ],
+                }
+            ],
+            # temperature=0：毎回なるべく同じ答えにする（抽出の作業なので、創造性は要らない）
+            inferenceConfig={"maxTokens": 512, "temperature": 0},
+        )
+    except bedrock.exceptions.ValidationException as e:
+        # ValidationException は「送った中身が受け付けられない」という意味（画像が大きすぎる、など）。
+        # 同じ中身を送り直しても通らないので恒久的な失敗。
+        # ThrottlingException（混雑）などはここで受け止めず、外へ出して SQS に渡し直させる。
+        raise PermanentError(f"Bedrock が受け付けなかった: {e}")
 
     usage = response["usage"]  # 入出力のトークン数。料金はこれで決まる
     logger.info(
