@@ -10,6 +10,7 @@
 import json
 import logging
 import os
+import time
 from urllib.parse import unquote_plus
 
 import boto3
@@ -182,6 +183,41 @@ def analyze(bucket: str, key: str) -> None:
     save_result(key, ai_result)
 
 
+# Aurora は5分使われないと一時停止し、次の SQL で起き始める。起きるまで十数秒かかり、
+# その間に SQL を送ると DatabaseResumingException が返る。
+#
+# これは「待てば必ず直る」と分かっている一時的なエラーなので、SQS に6分預けてやり直すより、
+# その場で数秒待って送り直すほうが早い。最終試行の analysis_failed も書けるようになる。
+DB_RESUME_WAIT_SECONDS = 5  # 何秒おきに送り直すか
+DB_RESUME_MAX_ATTEMPTS = 6  # 何回まで送るか（待つのは最大 5秒 × 5回 = 25秒）
+
+
+def execute_sql(sql: str, parameters: list) -> dict:
+    """Data API で SQL を1本送る。DB が起きる途中なら、起きるまで待って送り直す。"""
+    for attempt in range(1, DB_RESUME_MAX_ATTEMPTS + 1):
+        try:
+            return rds_data.execute_statement(
+                resourceArn=DB_CLUSTER_ARN,
+                secretArn=DB_SECRET_ARN,
+                database=DB_NAME,
+                sql=sql,
+                parameters=parameters,
+            )
+        except rds_data.exceptions.DatabaseResumingException:
+            if attempt == DB_RESUME_MAX_ATTEMPTS:
+                # 25秒待っても起きなかった。ここで諦めて呼び出し元に任せる
+                # （一時的なエラーとして SQS がやり直す／最終試行なら DLQ とアラーム）
+                raise
+            logger.info(
+                "DB is resuming, retry in %ds (%d/%d)",
+                DB_RESUME_WAIT_SECONDS, attempt, DB_RESUME_MAX_ATTEMPTS,
+            )
+            time.sleep(DB_RESUME_WAIT_SECONDS)
+    # ここには来ない（ループは必ず return か raise で抜ける）。
+    # ただ、関数の最後に何も無いと「dict を返すはずなのに None を返しうる」と型チェック（mypy）に言われるので置いている。
+    raise AssertionError("unreachable")
+
+
 # 行は API（ステップ8）が署名付きURLを発行するときに作る。worker は UPDATE だけを担当する。
 # API ができるまでは make sql で手で INSERT しておく。
 #
@@ -204,12 +240,9 @@ update items
 
 def save_result(key: str, ai_result: dict) -> None:
     """AI の答えを items に保存して、status を pending_review に進める。"""
-    response = rds_data.execute_statement(
-        resourceArn=DB_CLUSTER_ARN,
-        secretArn=DB_SECRET_ARN,
-        database=DB_NAME,
-        sql=UPDATE_SQL,
-        parameters=[
+    response = execute_sql(
+        UPDATE_SQL,
+        [
             # typeHint="JSON"：文字列として渡すが、DB 側では jsonb として扱ってもらう
             {
                 "name": "ai_result",
@@ -242,12 +275,9 @@ update items
 
 def mark_failed(key: str, reason: str) -> None:
     """解析をあきらめたことを items に記録する。画面から手入力に回せるようにするため。"""
-    response = rds_data.execute_statement(
-        resourceArn=DB_CLUSTER_ARN,
-        secretArn=DB_SECRET_ARN,
-        database=DB_NAME,
-        sql=FAIL_SQL,
-        parameters=[
+    response = execute_sql(
+        FAIL_SQL,
+        [
             {"name": "ai_error", "value": {"stringValue": reason}},
             {"name": "ai_model", "value": {"stringValue": AI_MODEL}},
             {"name": "s3_key", "value": {"stringValue": key}},

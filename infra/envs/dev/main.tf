@@ -76,18 +76,24 @@ resource "aws_sqs_queue" "ingest_dlq" {
 # locals は1つのファイルにいくつ書いてもよい。使う場所の近くに置いている。
 locals {
   max_receive_count = 3
+
+  # worker（Lambda）が1回の実行に使ってよい最大の秒数。
+  # 写真の読み込み・Bedrock の待ち時間に加えて、DB が一時停止から起きるのを最大25秒待つ
+  # （handler.py の execute_sql）ので、30秒では足りず60秒にした。
+  # 本体キューの可視性タイムアウトはこれの6倍で決める（下の aws_sqs_queue.ingest）。
+  worker_timeout_seconds = 60
 }
 
 resource "aws_sqs_queue" "ingest" {
   name = "photo-intake-dev-ingest"
 
-  # Lambda のタイムアウト（30秒）より長くする。
+  # Lambda のタイムアウトより長くする。
   # 短いと、まだ処理中なのにメッセージが再表示され、別の実行にも配信される
-  # （＝二重処理）。AWS は関数タイムアウトの6倍を推奨しているので 30 × 6 = 180。
+  # （＝二重処理）。AWS は関数タイムアウトの6倍を推奨しているので 60 × 6 = 360秒（6分）。
   #
   # 余裕を持たせても害は小さい。失敗したときに再配信されるまで長く待つだけで、
-  # DLQ へ落ちるまでの時間が延びるだけだから。
-  visibility_timeout_seconds = 180
+  # DLQ へ落ちるまでの時間が延びるだけだから（いまは 6分 × 2回 ＝ 約12分で DLQ）。
+  visibility_timeout_seconds = local.worker_timeout_seconds * 6
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.ingest_dlq.arn
@@ -401,7 +407,7 @@ resource "aws_lambda_function" "worker" {
   runtime = "python3.12"
   handler = "handler.handler" # <ファイル名>.<関数名>
 
-  timeout     = 30
+  timeout     = local.worker_timeout_seconds # 上の locals。キューの可視性タイムアウトと連動
   memory_size = 256
 
   environment {
