@@ -211,6 +211,45 @@ resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
 }
 
 # ---------------------------------------------------------------------------
+# 冪等性の記録テーブル（DynamoDB）
+# ---------------------------------------------------------------------------
+#
+# SQS は同じ通知を2回渡すことがある（at-least-once）。
+# worker は処理を始める前にここを見て、「もう処理した／いま誰かが処理中」の通知なら飛ばす。
+# 書き込むのは worker 自身ではなく Powertools の @idempotent（6-3 で入れる）。
+#
+# 1行 ＝ 1つの通知。行の見分け方（id）は S3 のキーから作る。
+# 列の名前（id / expiration）は Powertools の既定に合わせている。変えると Powertools 側にも設定が要る。
+#
+# Aurora と違い、置いておくだけでは課金されない（読み書きした回数とデータ量だけ）。
+resource "aws_dynamodb_table" "idempotency" {
+  name = "photo-intake-dev-idempotency"
+
+  # オンデマンド課金：読み書きした分だけ払う。
+  # もう1つの PROVISIONED は「毎秒◯回まで」を先に決めて、使わなくてもその分を払う方式。
+  billing_mode = "PAY_PER_REQUEST"
+
+  # パーティションキー＝行を引くためのキー。この値で1行を特定する（RDB の主キーにあたる）。
+  # Terraform では hash_key という名前になっている（AWS 内部で値をハッシュして置き場所を決めるため）。
+  hash_key = "id"
+
+  # DynamoDB はスキーマを持たないので、列を全部は宣言しない。
+  # 宣言が要るのはキーに使う列だけ。S = 文字列。
+  attribute {
+    name = "id"
+    type = "S"
+  }
+
+  # TTL（Time To Live）：expiration 列の時刻を過ぎた行を、DynamoDB が自動で消す。
+  # Powertools は既定で「1時間後」を書き込む。古い記録を自分で掃除しなくて済む。
+  # 消すのは無料。ただし時刻ちょうどではなく、数日以内のどこかで消える。
+  ttl {
+    attribute_name = "expiration"
+    enabled        = true
+  }
+}
+
+# ---------------------------------------------------------------------------
 # worker Lambda の IAM ロール
 # ---------------------------------------------------------------------------
 #
