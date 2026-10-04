@@ -69,6 +69,16 @@ peek:             ## 本体キューと DLQ の中身を覗く（消さない）
 purge:            ## キューを空にする
 	aws sqs purge-queue --queue-url $(QUEUE)
 
+# S3 の通知と同じ形のメッセージを、手で SQS に送る。重複配信（同じ通知が2回届く）の再現用。
+#   make resend KEY=uploads/wallet.jpg
+# worker が読むのは bucket.name と object.key だけなので、それだけ入れている。
+# 本物の通知ではキーが URL エンコードされる（空白は + など）。英数字だけのキーならそのままでよい。
+.PHONY: resend
+KEY ?= uploads/test.txt
+resend:           ## S3 の通知と同じ形のメッセージを手で送る
+	aws sqs send-message --queue-url $(QUEUE) \
+	  --message-body '{"Records":[{"s3":{"bucket":{"name":"$(BUCKET)"},"object":{"key":"$(KEY)"}}}]}'
+
 # --- DB ---
 .PHONY: sql
 
