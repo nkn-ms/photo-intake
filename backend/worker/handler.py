@@ -5,6 +5,10 @@
 失敗は2種類に分けて扱う:
   ・恒久的な失敗（何度やっても同じ）→ その場で analysis_failed にする。例外は投げない
   ・一時的な失敗（時間をおけば通るかも）→ 例外を投げて SQS に渡し直させる
+
+SQS は同じ通知を2回渡すことがある（at-least-once）。
+写真1枚の処理（process_photo）に Powertools の @idempotent_function を付けて、2回目は処理しない。
+Powertools が中でやっていることは docs/idempotency-by-hand.md に、同じことを手で書いた版がある。
 """
 
 import json
@@ -14,6 +18,14 @@ import time
 from urllib.parse import unquote_plus
 
 import boto3
+from aws_lambda_powertools.utilities.idempotency import (
+    DynamoDBPersistenceLayer,
+    IdempotencyConfig,
+    idempotent_function,
+)
+from aws_lambda_powertools.utilities.idempotency.exceptions import (
+    IdempotencyAlreadyInProgressError,
+)
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -23,6 +35,22 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime")
 rds_data = boto3.client("rds-data")  # Data API（HTTPS で SQL を送る）
+
+# 冪等性の記録先。Terraform が作った DynamoDB のテーブル（列の名前 id / expiration は Powertools の既定）
+idempotency_store = DynamoDBPersistenceLayer(table_name=os.environ["IDEMPOTENCY_TABLE"])
+
+idempotency_config = IdempotencyConfig(
+    # 何で「同じ通知」を見分けるか。process_photo に渡す photo のうち key（S3 のキー）だけを使う。
+    # API が登録ごとに新しいキーを発行するので、1つのキー ＝ 1回の登録。
+    # "key" は JMESPath（AWS CLI の --query と同じ書き方）で「photo の中の key」という意味。
+    event_key_jmespath="key",
+    # key が取り出せなかったら、冪等性を効かせずに素通りするのではなく、エラーにする
+    raise_on_no_idempotency_key=True,
+    # 「済み」の記録を何秒残すか（Powertools の既定と同じ。分かるように明示した）。過ぎたら TTL が消す。
+    # SQS の重複配信はたいてい数分以内、やり直しも 6分 × 3回 で終わるので、1時間あれば足りる。
+    # 1時間を過ぎて重複が来ても、Aurora の UPDATE（status = 'analyzing' の条件）が上書きを止める。
+    expires_after_seconds=3600,
+)
 
 # Data API に渡す3点セット。make sql が --resource-arn / --secret-arn / --database で渡しているのと同じもの。
 DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
@@ -93,6 +121,17 @@ def handler(event, context):
     """
     logger.info("received %d record(s)", len(event.get("Records", [])))
 
+    # この Lambda があと何秒で強制終了されるかを Powertools に教える。
+    #
+    # Lambda がタイムアウトすると、プログラムはその場で止められる（except も動かない）。
+    # すると Powertools は記録を消せず、「処理中」のまま DynamoDB に残る。
+    #   ・これを呼ばないと：「処理中」は expires_after_seconds（1時間）まで有効のまま。
+    #     6分後に SQS が渡し直しても「別の実行が処理中」と判断され、handler は処理しない（continue）。
+    #     正常に終わるので SQS はメッセージを消し、写真は解析されないまま analyzing で残る。
+    #   ・これを呼ぶと：「処理中」の期限が、この実行の残り時間（最大60秒）になる。
+    #     6分後の渡し直しのときには期限が過ぎているので、もう一度処理される。
+    idempotency_config.register_lambda_context(context)
+
     for record in event.get("Records", []):
         body = json.loads(record["body"])
 
@@ -110,12 +149,17 @@ def handler(event, context):
             # そのまま get_object に渡すと「そんなファイルは無い」と言われるので、元に戻す。
             key = unquote_plus(s3_event["s3"]["object"]["key"])
             try:
-                analyze(bucket, key)
-            except PermanentError as e:
-                # 恒久的なエラー。やり直しても同じなので、ここで処理を止める。
-                # 失敗を DB に書いて正常に終わるので、SQS はメッセージを消す（やり直しは起きない）。
-                logger.warning("analysis failed: %s: %s", key, e)
-                mark_failed(key, str(e))
+                # photo= を付けて呼ぶこと。Powertools は data_keyword_argument="photo" の名前で引数を探す
+                result = process_photo(photo={"bucket": bucket, "key": key})
+                # 2回目の通知では process_photo の中身は動かず、1回目の戻り値がそのまま返ってくる
+                # （downloaded や model answer のログが出ずに、これだけが出る）
+                logger.info("result: %s", result)
+            except IdempotencyAlreadyInProgressError:
+                # 同じ通知を、別の実行がいま処理している。待たずに、この実行では処理しない。
+                # 先の実行が失敗しても、そのメッセージは SQS に残っていて、SQS が渡し直すから。
+                # 失敗ではないので analysis_failed は書かない（書くと、先の実行の成功が保存されなくなる）。
+                logger.info("skipped: 別の実行が処理中: %s", key)
+                continue
             except Exception as e:
                 # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）。時間をおいて処理をやり直す。
                 # 例外を投げ直す（raise）と、SQS はメッセージを消さずに、少し後でもう一度渡してくれる。
@@ -157,6 +201,37 @@ def handler(event, context):
     # 正常終了すると、Lambda が SQS のメッセージを自動で削除する。
     # 例外を投げると削除されず、可視性タイムアウト後に再配信される。
     return {"ok": True}
+
+
+@idempotent_function(
+    data_keyword_argument="photo",
+    persistence_store=idempotency_store,
+    config=idempotency_config,
+)
+def process_photo(photo: dict) -> dict:
+    """写真1枚を処理して、DB に結果（成功 or 恒久的な失敗）を書く。
+
+    Powertools が中身の前後で次のことをする（手で書いた版は docs/idempotency-by-hand.md）:
+      前：DynamoDB に「処理中」を書く。もう「済み」なら中身を動かさず、前回の戻り値を返す。
+          「処理中」なら IdempotencyAlreadyInProgressError を投げる
+      後：return したら「済み」と戻り値を書く。例外が出たら記録を消す（次の配信でやり直せるように）
+
+    だから恒久的な失敗はここで受け止めて return する。外に例外として出すと記録が消され、
+    重複が来るたびにやり直す（JSON が読めない失敗なら Bedrock をもう一度呼ぶ）ことになる。
+    一時的な失敗は受け止めずに外に出す。記録が消え、handler が raise して SQS がやり直す。
+
+    戻り値は DynamoDB に保存されるので、JSON にできる形（dict / str / 数値）にする。
+    """
+    key = photo["key"]
+    try:
+        analyze(photo["bucket"], key)
+        return {"key": key, "outcome": "analyzed"}
+    except PermanentError as e:
+        # 恒久的なエラー。やり直しても同じなので、ここで処理を止める。
+        # 失敗を DB に書いて正常に終わるので、SQS はメッセージを消す（やり直しは起きない）。
+        logger.warning("analysis failed: %s: %s", key, e)
+        mark_failed(key, str(e))
+        return {"key": key, "outcome": "analysis_failed"}
 
 
 def analyze(bucket: str, key: str) -> None:
