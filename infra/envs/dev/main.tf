@@ -408,6 +408,34 @@ resource "aws_iam_role_policy" "worker_db" {
   })
 }
 
+# 【権限ポリシー その6】冪等性の記録テーブルを読み書きする。
+#
+# 実際に読み書きするのは worker のコードではなく Powertools の @idempotent。
+# ただし Powertools は worker の中で動くので、権限は worker のロールに付ける。
+# Powertools が使う操作は次の4つだけ:
+#   PutItem    … 「処理中」の行を書く（行がまだ無いときだけ書く、という条件付き）
+#   GetItem    … 書けなかったとき、既にある行を読んで「済み／処理中」を確かめる
+#   UpdateItem … 処理が終わったら「済み」と結果を書き込む
+#   DeleteItem … 処理が失敗したら行を消す（次の配信でやり直せるように）
+resource "aws_iam_role_policy" "worker_idempotency" {
+  name = "use-idempotency-table"  # ポリシーの名前
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+      ]
+      Resource = aws_dynamodb_table.idempotency.arn # ★このテーブルだけ
+    }]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # worker Lambda 本体
 # ---------------------------------------------------------------------------
@@ -415,8 +443,8 @@ resource "aws_iam_role_policy" "worker_db" {
 # Python のファイルを zip に固める。
 # Terraform に同梱されている archive provider の機能で、外部ツールは要らない。
 #
-# いまは外部ライブラリを使っていないのでこれで足りる。
-# 依存が増えたら terraform-aws-modules/lambda/aws か Lambda Layer に切り替える。
+# zip に入れるのは自分で書いた handler.py だけ。
+# 外部ライブラリ（Powertools）はレイヤーで足すので、ここに入れなくてよい（下の locals）。
 data "archive_file" "worker" {
   type        = "zip"
   source_file = "${path.module}/../../../backend/worker/handler.py"
@@ -433,6 +461,22 @@ resource "aws_cloudwatch_log_group" "worker" {
   retention_in_days = 14
 }
 
+# Powertools（AWS 公式の Lambda 用ライブラリ）のレイヤー。
+#
+# レイヤー＝関数の zip とは別に、Lambda に足せる「ライブラリの zip」。
+# 関数が起動するとき、レイヤーの中身も一緒に展開されて import できるようになる。
+# npm install した node_modules を、別の箱で配っているようなもの。
+#
+# Powertools は AWS が自分のアカウント（017000801446）でレイヤーとして公開している。
+# 自分で pip install して zip に詰める必要がない。
+#
+# 名前の読み方：V3（Powertools のメジャー版）-python312（runtime と揃える）-x86_64（CPU の種類。Lambda の既定）
+# 末尾の :38 はレイヤーの版。番号を固定しているので、AWS が新しい版を出しても勝手には変わらない
+# （2026-10-03 に公式ドキュメントで確認した最新）。
+locals {
+  powertools_layer_arn = "arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-x86_64:38"
+}
+
 resource "aws_lambda_function" "worker" {
   function_name = "photo-intake-dev-worker"
   role          = aws_iam_role.worker.arn # この関数はこのロールで動く（Lambda の API は ARN で受け取る）
@@ -445,6 +489,8 @@ resource "aws_lambda_function" "worker" {
 
   runtime = "python3.12"
   handler = "handler.handler" # <ファイル名>.<関数名>
+
+  layers = [local.powertools_layer_arn] # 上の locals
 
   timeout     = local.worker_timeout_seconds # 上の locals。キューの可視性タイムアウトと連動
   memory_size = 256
@@ -469,6 +515,9 @@ resource "aws_lambda_function" "worker" {
       # 本体キューの maxReceiveCount と同じ数（上の locals）。
       # 環境変数は文字列しか入らないので tostring で "3" にする。handler.py 側で int に戻す。
       MAX_RECEIVE_COUNT = tostring(local.max_receive_count)
+
+      # 冪等性の記録テーブルの名前。handler.py が Powertools に渡す（6-3）
+      IDEMPOTENCY_TABLE = aws_dynamodb_table.idempotency.name
     }
   }
 
