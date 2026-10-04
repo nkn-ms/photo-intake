@@ -528,8 +528,15 @@ resource "aws_lambda_function" "worker" {
 # 「このキューにメッセージが来たら、この関数を起動する」という紐付け。
 #
 # Lambda が SQS を見に行く（ポーリングする）形になる。
-# S3 → Lambda を直接繋ぐこともできるが、それだと失敗時のリトライと
-# DLQ を自前で用意することになる。SQS を挟んでいるのはそのため。
+#
+# S3 → Lambda を直接繋ぐこともできる（非同期呼び出し）。その場合も Lambda の内部に見えないキューがあり、
+# 失敗したら自動で最大2回やり直し、失敗時の送り先（DLQ にあたるもの）も設定できる。
+# それでも SQS を挟んでいるのは、直結では次のことができないため:
+#   ・やり直しの間隔を決める（直結は約1分・約2分で固定。こちらは可視性タイムアウトで6分）
+#   ・何回目の配信かを知る（ApproximateReceiveCount。最終試行で analysis_failed を書くのに使う）
+#   ・このキューの分だけ同時に動く台数を絞る（maximum_concurrency）
+#   ・溜まっている件数を見る、DLQ から元のキューへ戻す（redrive）、14日まで保持する（直結は6時間）
+# 直結でも同じイベントが2回届くことはある（at-least-once）。冪等性は SQS の有無に関係なく要る。
 resource "aws_lambda_event_source_mapping" "worker" {
   event_source_arn = aws_sqs_queue.ingest.arn
   function_name    = aws_lambda_function.worker.arn
