@@ -45,8 +45,9 @@ DONE_TTL_SECONDS = 3600
 def claim(key: str, context) -> bool:
     """この写真の処理を始めてよいか。DynamoDB に「処理中」を書けたら True。
 
-    書けるのは次のどちらかのときだけ:
+    書けるのは次のどれかのときだけ:
       ・行が無い（初めての通知）
+      ・行はあるが expiration を過ぎている（TTL の削除は数日遅れることがあるので、残っている場合がある）
       ・「処理中」のまま期限が過ぎている（前の実行がタイムアウトで死んだ）
     書けなかったら「済み」か「別の実行が処理中」なので False を返す（呼び出し元は処理しない）。
 
@@ -68,6 +69,7 @@ def claim(key: str, context) -> bool:
             # 条件付き書き込み：この条件が成り立つときだけ書く。成り立たなければ例外になる
             ConditionExpression=(
                 "attribute_not_exists(id)"
+                " OR expiration < :now"
                 " OR (#status = :in_progress AND in_progress_until < :now)"
             ),
             # status は DynamoDB の予約語なので、式の中に直接は書けない。#status という仮の名前を使う
@@ -136,14 +138,17 @@ mark_done(key)
 
 | この版 | Powertools（`@idempotent_function`） |
 |---|---|
-| `claim` の条件付き `PutItem` | 関数の中身を実行する前に、同じく条件付き `PutItem` で「処理中」を書く |
+| `claim` の条件付き `PutItem` | 関数の中身を実行する前に、同じく条件付き `PutItem` で「処理中」を書く（条件も同じ3つ：行が無い／`expiration` 切れ／処理中のまま期限切れ）。`persistence/dynamodb.py` の `_put_record` |
 | `claim` が False | 「済み」なら記録してあった戻り値を返し、中身は実行しない。「処理中」なら `IdempotencyAlreadyInProgressError` を投げる |
 | `in_progress_until`（`context.get_remaining_time_in_millis()` から計算） | `config.register_lambda_context(context)` を呼ぶと同じことをする |
-| `mark_done` | 関数が return したら `UpdateItem` で「済み」と戻り値を書く |
-| `release` | 関数が例外を投げたら `DeleteItem` で記録を消す |
+| `mark_done` | 関数が return したら `UpdateItem` で「済み」と戻り値を書く（`_update_record`） |
+| `release` | 関数が例外を投げたら `DeleteItem` で記録を消す（`_delete_record`） |
 | `id` = S3 のキーそのまま | `id` = 「関数名#（冪等性キーのハッシュ）」 |
 | `DONE_TTL_SECONDS = 3600` | `expires_after_seconds`（既定 3600） |
 | なし | 戻り値の保存、ペイロードの検証、ローカルキャッシュなど |
+
+Powertools のソースは GitHub の `aws-powertools/powertools-lambda-python`、
+`aws_lambda_powertools/utilities/idempotency/` の下にある（`base.py` が流れ、`persistence/dynamodb.py` が DynamoDB への読み書き）。
 
 ## 面談での言い方
 
