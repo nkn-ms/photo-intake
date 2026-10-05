@@ -10,8 +10,18 @@ dependencies = [
     "aws-lambda-powertools[tracer]",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest", "moto[all]", "mypy", "ruff", "httpx"]
+# 開発のときだけ使うもの（package.json の devDependencies に当たる）。Lambda には載せない。
+# uv sync は dev グループを既定で入れる。
+[dependency-groups]
+dev = [
+    "pytest",
+    # 偽物にするサービスだけを指定する。moto[all] は全サービス分の依存（Docker 関連など）まで入って重い。
+    # rds-data は追加の依存が要らないので、ここに書かなくても使える。
+    "moto[s3,dynamodb]",
+    "mypy",
+    "ruff",
+    "httpx",
+]
 
 [tool.mypy]
 python_version = "3.12"
