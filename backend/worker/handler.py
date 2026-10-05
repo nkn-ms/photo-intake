@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
 
@@ -130,13 +131,9 @@ class PermanentError(Exception):
 
 
 def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
-    """Lambda のエントリポイント。
+    """Lambda のエントリポイント。届いた写真を1枚ずつ analyze_and_record に渡し、失敗を扱う。
 
-    event の形は SQS 経由の場合こうなる:
-        {"Records": [{"body": "<S3イベントのJSON文字列>", ...}, ...]}
-
-    S3 のイベント自体も {"Records": [...]} という形なので、
-    二重に入れ子になっている点に注意。
+    event の読み解き（二重の入れ子）は parse_event に任せている。
     """
     logger.info("received %d record(s)", len(event.get("Records", [])))
 
@@ -151,77 +148,112 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
     #     6分後の渡し直しのときには期限が過ぎているので、もう一度処理される。
     idempotency_config.register_lambda_context(context)
 
+    for upload in parse_event(event):
+        try:
+            # photo= を付けて呼ぶこと。Powertools は data_keyword_argument="photo" の名前で引数を探す
+            result = analyze_and_record(photo={"bucket": upload.bucket, "key": upload.key})
+            # 2回目の通知では analyze_and_record の中身は動かず、1回目の戻り値がそのまま返ってくる
+            # （downloaded や model answer のログが出ずに、これだけが出る）
+            logger.info("result: %s", result)
+        except IdempotencyAlreadyInProgressError:
+            # 同じ通知を、別の実行がいま処理している。待たずに、この実行では処理しない。
+            # 先の実行が失敗しても、そのメッセージは SQS に残っていて、SQS が渡し直すから。
+            # 失敗ではないので analysis_failed は書かない（書くと、先の実行の成功が保存されなくなる）。
+            logger.info("skipped: 別の実行が処理中: %s", upload.key)
+            continue
+        except Exception as e:
+            # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）か、想定していないエラー（バグなど）。
+            # どちらか見分けられないので、やり直す側に倒す。本当にバグなら3回とも失敗し、
+            # DLQ → アラームで開発者が気づく。
+            # 例外を投げ直す（raise）と、SQS はメッセージを消さずに、少し後でもう一度渡してくれる。
+            #
+            # SQS は同じメッセージを MAX_RECEIVE_COUNT 回（3回）まで渡してくれる:
+            #    0分  1回目 失敗 → raise → SQS「3分後にもう一度」
+            #    3分  2回目 失敗 → raise → SQS「3分後にもう一度」
+            #    6分  3回目 失敗 → raise → SQS「もう諦める。DLQ へ」
+            # 3回目が「最終試行」（DLQ に移る前の最後の配信）。これより後に worker が呼ばれることはない。
+            #
+            # ■ なぜ最終試行で analysis_failed を書くのか
+            #   DLQ と DB は見る人が違う。
+            #     ・DLQ … 開発者が見る（アラームのメールで気づく）
+            #     ・DB  … スタッフが管理画面で見る。画面は DLQ を読まない
+            #   書かずに DLQ へ落ちると、画面には analyzing（解析中）が出続け、
+            #   「待てば終わるのか、もう終わらないのか」がスタッフに分からない。
+            #   手入力に回すボタンも analysis_failed の行にしか出ない。
+            #
+            # ■ なぜ1回目・2回目では書かないのか
+            #   次の配信で成功するかもしれないから。先に analysis_failed を書くと、
+            #   次の配信で成功しても save_result の条件（status = 'analyzing'）に合わず、
+            #   成功が保存されないまま失敗として残ってしまう。
+            if upload.receive_count >= MAX_RECEIVE_COUNT:
+                logger.error("giving up after %d attempts: %s", upload.receive_count, upload.key)
+                mark_failed(
+                    upload.key,
+                    f"{upload.receive_count}回試して失敗: {type(e).__name__}: {e}",
+                )
+
+            # ■ なぜ最終試行でも raise するのか（恒久的なエラーのように、ここで処理を止めない）
+            #   raise すると DLQ に入り、アラームが開発者にメールする。
+            #   一時的な失敗が3回続いた＝写真1枚ではなく「仕組み」が壊れている疑いがあるので、
+            #   スタッフの画面だけでなく開発者にも知らせたい。
+            #   （恒久的なエラーは写真1枚の問題なので、上の except で処理を止めて画面だけにしている）
+            #
+            # 引数なしの raise は「いま捕まえた例外をそのまま投げ直す」。TS の throw e と同じ。
+            raise
+
+    # 正常終了すると、Lambda が SQS のメッセージを自動で削除する。
+    # 例外を投げると削除されず、可視性タイムアウト後に再配信される。
+    return {"ok": True}
+
+
+@dataclass(frozen=True)
+class Upload:
+    """S3 に置かれた写真1枚分の通知。parse_event が event から取り出す。
+
+    dataclass は、名前付きの値をまとめるだけの小さなクラスを短く書く仕組み
+    （TS の type Upload = { bucket: string; key: string; receiveCount: number } に近い）。
+    frozen=True で、作った後に値を書き換えられないようにしている。
+    """
+
+    bucket: str
+    key: str
+    receive_count: int  # 何回目の配信か（最終試行の判断に使う）
+
+
+def parse_event(event: dict[str, Any]) -> list[Upload]:
+    """SQS から届いた event を読み解いて、写真の一覧にする。
+
+    event は二重の入れ子になっている（SQS のメッセージの一覧の中に、S3 のイベントの一覧）:
+        {"Records": [{"body": "{\"Records\": [{\"s3\": {...}}]}", "attributes": {...}}, ...]}
+    その入れ子はこの関数の中に閉じ込め、handler には平らな一覧だけを渡す。
+
+    全部読んでから一覧を返すので、形の壊れたメッセージがあれば、写真を1枚も処理しないうちに落ちる。
+    ※ batch_size を上げて部分的なバッチ応答（ReportBatchItemFailures）を入れるなら、
+      メッセージ1通ごとに「読む → 処理する → 結果を報告する」形に見直すこと（5e-3 の判断を参照）。
+    """
+    uploads = []
     for record in event.get("Records", []):
         body = json.loads(record["body"])
-
-        # このメッセージが何回目の配信か。SQS は数字を文字列で入れてくる
-        receive_count = int(record["attributes"]["ApproximateReceiveCount"])
 
         # S3 のテスト通知（バケット設定時に送られる）には Records が無い
         if "Records" not in body:
             logger.info("skipped non-s3 event: %s", body.get("Event", "unknown"))
             continue
 
+        # このメッセージが何回目の配信か。SQS は数字を文字列で入れてくる
+        receive_count = int(record["attributes"]["ApproximateReceiveCount"])
+
         for s3_event in body["Records"]:
-            bucket = s3_event["s3"]["bucket"]["name"]
-            # S3 の通知に入るキーは URL エンコードされている（空白は +、日本語は %E3%81... になる）。
-            # そのまま get_object に渡すと「そんなファイルは無い」と言われるので、元に戻す。
-            key = unquote_plus(s3_event["s3"]["object"]["key"])
-            try:
-                # photo= を付けて呼ぶこと。Powertools は data_keyword_argument="photo" の名前で引数を探す
-                result = analyze_and_record(photo={"bucket": bucket, "key": key})
-                # 2回目の通知では analyze_and_record の中身は動かず、1回目の戻り値がそのまま返ってくる
-                # （downloaded や model answer のログが出ずに、これだけが出る）
-                logger.info("result: %s", result)
-            except IdempotencyAlreadyInProgressError:
-                # 同じ通知を、別の実行がいま処理している。待たずに、この実行では処理しない。
-                # 先の実行が失敗しても、そのメッセージは SQS に残っていて、SQS が渡し直すから。
-                # 失敗ではないので analysis_failed は書かない（書くと、先の実行の成功が保存されなくなる）。
-                logger.info("skipped: 別の実行が処理中: %s", key)
-                continue
-            except Exception as e:
-                # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）か、想定していないエラー（バグなど）。
-                # どちらか見分けられないので、やり直す側に倒す。本当にバグなら3回とも失敗し、
-                # DLQ → アラームで開発者が気づく。
-                # 例外を投げ直す（raise）と、SQS はメッセージを消さずに、少し後でもう一度渡してくれる。
-                #
-                # SQS は同じメッセージを MAX_RECEIVE_COUNT 回（3回）まで渡してくれる:
-                #    0分  1回目 失敗 → raise → SQS「3分後にもう一度」
-                #    3分  2回目 失敗 → raise → SQS「3分後にもう一度」
-                #    6分  3回目 失敗 → raise → SQS「もう諦める。DLQ へ」
-                # 3回目が「最終試行」（DLQ に移る前の最後の配信）。これより後に worker が呼ばれることはない。
-                #
-                # ■ なぜ最終試行で analysis_failed を書くのか
-                #   DLQ と DB は見る人が違う。
-                #     ・DLQ … 開発者が見る（アラームのメールで気づく）
-                #     ・DB  … スタッフが管理画面で見る。画面は DLQ を読まない
-                #   書かずに DLQ へ落ちると、画面には analyzing（解析中）が出続け、
-                #   「待てば終わるのか、もう終わらないのか」がスタッフに分からない。
-                #   手入力に回すボタンも analysis_failed の行にしか出ない。
-                #
-                # ■ なぜ1回目・2回目では書かないのか
-                #   次の配信で成功するかもしれないから。先に analysis_failed を書くと、
-                #   次の配信で成功しても save_result の条件（status = 'analyzing'）に合わず、
-                #   成功が保存されないまま失敗として残ってしまう。
-                if receive_count >= MAX_RECEIVE_COUNT:
-                    logger.error("giving up after %d attempts: %s", receive_count, key)
-                    mark_failed(
-                        key,
-                        f"{receive_count}回試して失敗: {type(e).__name__}: {e}",
-                    )
-
-                # ■ なぜ最終試行でも raise するのか（恒久的なエラーのように、ここで処理を止めない）
-                #   raise すると DLQ に入り、アラームが開発者にメールする。
-                #   一時的な失敗が3回続いた＝写真1枚ではなく「仕組み」が壊れている疑いがあるので、
-                #   スタッフの画面だけでなく開発者にも知らせたい。
-                #   （恒久的なエラーは写真1枚の問題なので、上の except で処理を止めて画面だけにしている）
-                #
-                # 引数なしの raise は「いま捕まえた例外をそのまま投げ直す」。TS の throw e と同じ。
-                raise
-
-    # 正常終了すると、Lambda が SQS のメッセージを自動で削除する。
-    # 例外を投げると削除されず、可視性タイムアウト後に再配信される。
-    return {"ok": True}
+            uploads.append(
+                Upload(
+                    bucket=s3_event["s3"]["bucket"]["name"],
+                    # S3 の通知に入るキーは URL エンコードされている（空白は +、日本語は %E3%81... になる）。
+                    # そのまま get_object に渡すと「そんなファイルは無い」と言われるので、元に戻す。
+                    key=unquote_plus(s3_event["s3"]["object"]["key"]),
+                    receive_count=receive_count,
+                )
+            )
+    return uploads
 
 
 # Powertools のデコレーターは戻り値の型を Any と宣言しているので、mypy は「型の無いデコレーター」と言う。
