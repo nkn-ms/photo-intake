@@ -108,7 +108,10 @@ if not claim(key, context):
     continue
 
 try:
-    analyze(bucket, key)
+    image_format = check_format(key)
+    image_bytes = download(bucket, key)
+    answer = ask_model(image_bytes, image_format)
+    save_result(key, parse_answer(answer))
 except PermanentError as e:
     # 恒久的な失敗。下の mark_done まで進むので「済み」になる＝重複が来ても、もう一度は試さない
     mark_failed(key, str(e))

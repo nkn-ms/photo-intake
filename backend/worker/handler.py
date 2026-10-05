@@ -7,7 +7,7 @@
   ・一時的な失敗（時間をおけば通るかも）→ 例外を投げて SQS に渡し直させる
 
 SQS は同じ通知を2回渡すことがある（at-least-once）。
-写真1枚の処理（process_photo）に Powertools の @idempotent_function を付けて、2回目は処理しない。
+写真1枚の処理（analyze_and_record）に Powertools の @idempotent_function を付けて、2回目は処理しない。
 Powertools が中でやっていることは docs/idempotency-by-hand.md に、同じことを手で書いた版がある。
 """
 
@@ -57,7 +57,7 @@ rds_data = boto3.client("rds-data")  # Data API（HTTPS で SQL を送る）
 idempotency_store = DynamoDBPersistenceLayer(table_name=os.environ["IDEMPOTENCY_TABLE"])
 
 idempotency_config = IdempotencyConfig(
-    # 何で「同じ通知」を見分けるか。process_photo に渡す photo のうち key（S3 のキー）だけを使う。
+    # 何で「同じ通知」を見分けるか。analyze_and_record に渡す photo のうち key（S3 のキー）だけを使う。
     # API が登録ごとに新しいキーを発行するので、1つのキー ＝ 1回の登録。
     # "key" は JMESPath（AWS CLI の --query と同じ書き方）で「photo の中の key」という意味。
     event_key_jmespath="key",
@@ -169,8 +169,8 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
             key = unquote_plus(s3_event["s3"]["object"]["key"])
             try:
                 # photo= を付けて呼ぶこと。Powertools は data_keyword_argument="photo" の名前で引数を探す
-                result = process_photo(photo={"bucket": bucket, "key": key})
-                # 2回目の通知では process_photo の中身は動かず、1回目の戻り値がそのまま返ってくる
+                result = analyze_and_record(photo={"bucket": bucket, "key": key})
+                # 2回目の通知では analyze_and_record の中身は動かず、1回目の戻り値がそのまま返ってくる
                 # （downloaded や model answer のログが出ずに、これだけが出る）
                 logger.info("result: %s", result)
             except IdempotencyAlreadyInProgressError:
@@ -180,7 +180,9 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
                 logger.info("skipped: 別の実行が処理中: %s", key)
                 continue
             except Exception as e:
-                # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）。時間をおいて処理をやり直す。
+                # 一時的なエラー（DB の起動待ち、Bedrock の混雑など）か、想定していないエラー（バグなど）。
+                # どちらか見分けられないので、やり直す側に倒す。本当にバグなら3回とも失敗し、
+                # DLQ → アラームで開発者が気づく。
                 # 例外を投げ直す（raise）と、SQS はメッセージを消さずに、少し後でもう一度渡してくれる。
                 #
                 # SQS は同じメッセージを MAX_RECEIVE_COUNT 回（3回）まで渡してくれる:
@@ -223,14 +225,17 @@ def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
 
 
 # Powertools のデコレーターは戻り値の型を Any と宣言しているので、mypy は「型の無いデコレーター」と言う。
-# 中身（process_photo）の型は自分で書いてあるので、この指摘だけを黙らせる。
+# 中身（analyze_and_record）の型は自分で書いてあるので、この指摘だけを黙らせる。
 @idempotent_function(  # type: ignore[untyped-decorator]
     data_keyword_argument="photo",
     persistence_store=idempotency_store,
     config=idempotency_config,
 )
-def process_photo(photo: dict[str, str]) -> dict[str, str]:
-    """写真1枚を処理して、DB に結果（成功 or 恒久的な失敗）を書く。
+def analyze_and_record(photo: dict[str, str]) -> dict[str, str]:
+    """写真1枚を解析し、結果を items に記録する（成功なら pending_review、恒久的な失敗なら analysis_failed）。
+
+    手順はこの関数に全部並んでいる。下の部品（check_format など）はどれも1つのことだけをして返し、
+    部品同士は呼び合わない。
 
     Powertools が中身の前後で次のことをする（手で書いた版は docs/idempotency-by-hand.md）:
       前：DynamoDB に「処理中」を書く。もう「済み」なら中身を動かさず、前回の戻り値を返す。
@@ -245,38 +250,50 @@ def process_photo(photo: dict[str, str]) -> dict[str, str]:
     """
     key = photo["key"]
     try:
-        analyze(photo["bucket"], key)
-        return {"key": key, "outcome": "analyzed"}
+        image_format = check_format(key)  # 1. 対応している形式か
+        image_bytes = download(photo["bucket"], key)  # 2. S3 から写真を読む
+        answer = ask_model(image_bytes, image_format)  # 3. モデルに聞く
+        ai_result = parse_answer(answer)  # 4. 答えを JSON として読む
     except PermanentError as e:
-        # 恒久的なエラー。やり直しても同じなので、ここで処理を止める。
+        # 恒久的なエラー（1 か 4）。やり直しても同じなので、ここで処理を止める。
         # 失敗を DB に書いて正常に終わるので、SQS はメッセージを消す（やり直しは起きない）。
         logger.warning("analysis failed: %s: %s", key, e)
         mark_failed(key, str(e))
         return {"key": key, "outcome": "analysis_failed"}
 
+    save_result(key, ai_result)  # 5. 保存して pending_review に進める
+    return {"key": key, "outcome": "analyzed"}
 
-def analyze(bucket: str, key: str) -> None:
-    """写真1枚を読み、モデルに渡して、答えをログに出す。"""
+
+def check_format(key: str) -> ImageFormatType:
+    """拡張子から Converse API の format を返す。対応していない形式なら PermanentError。"""
     ext = os.path.splitext(key)[1].lower()
     image_format = IMAGE_FORMATS.get(ext)
     if image_format is None:
         raise PermanentError(f"未対応の形式: {ext or '(拡張子なし)'}")
+    return image_format
 
-    # 通知には「どのファイルか」しか入っていないので、写真そのものを取りに行く
+
+def download(bucket: str, key: str) -> bytes:
+    """S3 から写真を読む。通知には「どのファイルか」しか入っていないので、写真そのものを取りに行く。"""
     image_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     logger.info("downloaded s3://%s/%s (%d bytes)", bucket, key, len(image_bytes))
+    return image_bytes
 
-    answer = ask_model(image_bytes, image_format)
+
+def parse_answer(answer: str) -> dict[str, Any]:
+    """モデルの答えを JSON として読む。読めなければ PermanentError。
+
+    同じ写真・同じ temperature=0 で渡し直しても、同じ答えが返ってくるだけなので恒久的な失敗。
+    （本物のモデルは ```json で囲んで返すことがある。その扱いは Bedrock が使えるようになってから決める）
+    """
     logger.info("model answer: %s", answer)
-
-    # 同じ写真・同じ temperature=0 で渡し直しても、同じ答えが返ってくるだけなので恒久的な失敗。
-    # （本物のモデルは ```json で囲んで返すことがある。その扱いは Bedrock が使えるようになってから決める）
     try:
-        ai_result = json.loads(answer)
+        ai_result: dict[str, Any] = json.loads(answer)
     except json.JSONDecodeError:
         # 答えの頭だけを残す。人が画面で見て「なぜ失敗したか」が分かるように
         raise PermanentError(f"モデルの答えが JSON として読めない: {answer[:200]}")
-    save_result(key, ai_result)
+    return ai_result
 
 
 # Aurora は5分使われないと一時停止し、次の SQL で起き始める。起きるまで十数秒かかり、
