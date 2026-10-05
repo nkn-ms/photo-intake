@@ -11,10 +11,15 @@ SQS は同じ通知を2回渡すことがある（at-least-once）。
 Powertools が中でやっていることは docs/idempotency-by-hand.md に、同じことを手で書いた版がある。
 """
 
+# 型注釈を実行時に評価しない（文字列のまま持っておく）。
+# 下の TYPE_CHECKING の中でしか import しない型を、注釈に書けるようにするため。
+from __future__ import annotations
+
 import json
 import logging
 import os
 import time
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
 
 import boto3
@@ -26,6 +31,18 @@ from aws_lambda_powertools.utilities.idempotency import (
 from aws_lambda_powertools.utilities.idempotency.exceptions import (
     IdempotencyAlreadyInProgressError,
 )
+from aws_lambda_powertools.utilities.typing import LambdaContext
+
+# boto3 の型（types-boto3）は開発用のパッケージで、Lambda には入っていない。
+# TYPE_CHECKING は mypy が検査するときだけ True になり、実行時は False。
+# だから Lambda ではこの import は実行されず、「そんなパッケージは無い」で落ちることもない。
+# （TS の import type に当たる）
+if TYPE_CHECKING:
+    from types_boto3_bedrock_runtime.literals import ImageFormatType
+    from types_boto3_rds_data.type_defs import (
+        ExecuteStatementResponseTypeDef,
+        SqlParameterTypeDef,
+    )
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -85,7 +102,9 @@ DUMMY_ANSWER = json.dumps(
 
 # 拡張子 → Converse API の format。
 # format に "jpg" という値は無い（"jpeg" だけ）。Playground で JPG を選べなかったのと同じ種類の落とし穴。
-IMAGE_FORMATS = {
+# ImageFormatType は "jpeg" | "png" | "gif" | "webp" のような決まった文字列だけを許す型。
+# 右側に "jpg" と書き間違えると、mypy がその場で指摘してくれる。
+IMAGE_FORMATS: dict[str, ImageFormatType] = {
     ".jpg": "jpeg",
     ".jpeg": "jpeg",
     ".png": "png",
@@ -110,7 +129,7 @@ class PermanentError(Exception):
     """
 
 
-def handler(event, context):
+def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, bool]:
     """Lambda のエントリポイント。
 
     event の形は SQS 経由の場合こうなる:
@@ -203,12 +222,14 @@ def handler(event, context):
     return {"ok": True}
 
 
-@idempotent_function(
+# Powertools のデコレーターは戻り値の型を Any と宣言しているので、mypy は「型の無いデコレーター」と言う。
+# 中身（process_photo）の型は自分で書いてあるので、この指摘だけを黙らせる。
+@idempotent_function(  # type: ignore[untyped-decorator]
     data_keyword_argument="photo",
     persistence_store=idempotency_store,
     config=idempotency_config,
 )
-def process_photo(photo: dict) -> dict:
+def process_photo(photo: dict[str, str]) -> dict[str, str]:
     """写真1枚を処理して、DB に結果（成功 or 恒久的な失敗）を書く。
 
     Powertools が中身の前後で次のことをする（手で書いた版は docs/idempotency-by-hand.md）:
@@ -267,7 +288,7 @@ DB_RESUME_WAIT_SECONDS = 5  # 何秒おきに送り直すか
 DB_RESUME_MAX_ATTEMPTS = 6  # 何回まで送るか（待つのは最大 5秒 × 5回 = 25秒）
 
 
-def execute_sql(sql: str, parameters: list) -> dict:
+def execute_sql(sql: str, parameters: list[SqlParameterTypeDef]) -> ExecuteStatementResponseTypeDef:
     """Data API で SQL を1本送る。DB が起きる途中なら、起きるまで待って送り直す。"""
     for attempt in range(1, DB_RESUME_MAX_ATTEMPTS + 1):
         try:
@@ -285,7 +306,9 @@ def execute_sql(sql: str, parameters: list) -> dict:
                 raise
             logger.info(
                 "DB is resuming, retry in %ds (%d/%d)",
-                DB_RESUME_WAIT_SECONDS, attempt, DB_RESUME_MAX_ATTEMPTS,
+                DB_RESUME_WAIT_SECONDS,
+                attempt,
+                DB_RESUME_MAX_ATTEMPTS,
             )
             time.sleep(DB_RESUME_WAIT_SECONDS)
     # ここには来ない（ループは必ず return か raise で抜ける）。
@@ -313,7 +336,7 @@ update items
 """
 
 
-def save_result(key: str, ai_result: dict) -> None:
+def save_result(key: str, ai_result: dict[str, Any]) -> None:
     """AI の答えを items に保存して、status を pending_review に進める。"""
     response = execute_sql(
         UPDATE_SQL,
@@ -365,7 +388,7 @@ def mark_failed(key: str, reason: str) -> None:
         logger.info("saved: %s -> analysis_failed", key)
 
 
-def ask_model(image_bytes: bytes, image_format: str) -> str:
+def ask_model(image_bytes: bytes, image_format: ImageFormatType) -> str:
     """写真をモデルに渡して、答え（文字列）を返す。"""
     if ANALYZER == "dummy":
         logger.info("ANALYZER=dummy: Bedrock は呼ばずに決め打ちの答えを返す")
@@ -394,7 +417,5 @@ def ask_model(image_bytes: bytes, image_format: str) -> str:
         raise PermanentError(f"Bedrock が受け付けなかった: {e}")
 
     usage = response["usage"]  # 入出力のトークン数。料金はこれで決まる
-    logger.info(
-        "tokens: input=%d output=%d", usage["inputTokens"], usage["outputTokens"]
-    )
+    logger.info("tokens: input=%d output=%d", usage["inputTokens"], usage["outputTokens"])
     return response["output"]["message"]["content"][0]["text"]

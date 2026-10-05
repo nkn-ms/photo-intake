@@ -9,9 +9,7 @@ import json
 import boto3
 import pytest
 from botocore.exceptions import ClientError
-
 from conftest import BUCKET
-
 
 # --- テストで使う道具 ---
 
@@ -113,7 +111,9 @@ def test_モデルの答えがJSONとして読めなければanalysis_failedに�
 # --- ここから下は、道具をもう2つ使う ---
 
 # モデルの正しい答え（JSON の文字列）。成功の経路と、冪等性のテストで使う
-GOOD_ANSWER = json.dumps({"category": "財布", "color": "黒", "brand": None, "features": ["二つ折り"]})
+GOOD_ANSWER = json.dumps(
+    {"category": "財布", "color": "黒", "brand": None, "features": ["二つ折り"]}
+)
 
 
 def throttling_error() -> ClientError:
@@ -160,7 +160,9 @@ def test_正しい答えならpending_reviewで保存する(worker, sent_sql, mo
     assert json.loads(values["ai_result"]) == json.loads(GOOD_ANSWER)
 
 
-def test_一時的な失敗は最終試行でなければraiseしてanalysis_failedを書かない(worker, sent_sql, monkeypatch):
+def test_一時的な失敗は最終試行でなければraiseしてanalysis_failedを書かない(
+    worker, sent_sql, monkeypatch
+):
     put_photo("uploads/wallet.jpg")
     monkeypatch.setattr(worker, "ask_model", FakeModel(throttling_error()))
 
@@ -191,7 +193,9 @@ def test_一時的な失敗の後は次の配信でやり直せる(worker, sent_
     assert [sql for sql, _ in sent_sql] == [worker.UPDATE_SQL]
 
 
-def test_一時的な失敗でも最終試行ならanalysis_failedを書いてからraiseする(worker, sent_sql, monkeypatch):
+def test_一時的な失敗でも最終試行ならanalysis_failedを書いてからraiseする(
+    worker, sent_sql, monkeypatch
+):
     put_photo("uploads/wallet.jpg")
     monkeypatch.setattr(worker, "ask_model", FakeModel(throttling_error()))
 

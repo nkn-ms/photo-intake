@@ -21,6 +21,7 @@ dev = [
     "mypy",
     "ruff",
     "httpx",
+    "types-boto3[bedrock-runtime,rds-data,s3]>=1.43.108",
 ]
 
 [tool.pytest.ini_options]
@@ -32,6 +33,9 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# uv run mypy だけで検査できるように、対象を書いておく。
+# tests/ は入れない（偽物の関数や monkeypatch に型を付けても、得られるものが少ない）
+files = ["worker"]
 
 [tool.ruff]
 line-length = 100
