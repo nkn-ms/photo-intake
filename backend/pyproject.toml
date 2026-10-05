@@ -23,6 +23,12 @@ dev = [
     "httpx",
 ]
 
+[tool.pytest.ini_options]
+# テストから import handler で worker/handler.py を読めるようにする。
+# Lambda でも zip の一番上に handler.py が置かれ、import handler として読まれるので、それに合わせている。
+pythonpath = ["worker"]
+testpaths = ["tests"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
