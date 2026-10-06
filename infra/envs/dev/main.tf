@@ -755,7 +755,18 @@ resource "aws_cognito_user_pool_client" "web" {
   # 分けると、どのメールアドレスが登録されているかを外から調べられてしまう。
   prevent_user_existence_errors = "ENABLED"
 
-  # トークンの有効期限は既定のまま（ID・アクセストークン 1時間、リフレッシュトークン 30日）
+  # トークンの有効期限。ID・アクセストークンは variables.tf の token_validity_hours（dev は12時間、本番は1時間）。
+  # リフレッシュトークンは既定と同じ30日（これが切れたら、もう一度パスワードでログインする）。
+  access_token_validity  = var.token_validity_hours
+  id_token_validity      = var.token_validity_hours
+  refresh_token_validity = 30
+
+  # 上の数字の単位。3つとも書く決まり（1つでも省くと、その分が既定の単位になって紛らわしい）
+  token_validity_units {
+    access_token  = "hours"
+    id_token      = "hours"
+    refresh_token = "days"
+  }
 }
 
 # CLI でユーザーを作ったりログインしたりするときに使う

@@ -40,3 +40,19 @@ variable "analyzer" {
     error_message = "analyzer は bedrock か dummy のどちらか。"
   }
 }
+
+variable "token_validity_hours" {
+  type        = number
+  description = "Cognito の ID トークン・アクセストークンの有効期限（時間）"
+
+  # dev は12時間：CLI（make token）で1日に1回ログインすれば作業が続けられるように。
+  # 本番は 1 にする。アクセストークンは API Gateway が署名だけで確かめる（Cognito に問い合わせない）ので、
+  # 発行した後で取り消せない。盗まれたときに使われてしまう時間を短くするため。
+  # 画面（ステップ9）はリフレッシュトークンで裏側から自動で取り直すので、1時間でも利用者は困らない。
+  default = 12
+
+  validation {
+    condition     = var.token_validity_hours >= 1 && var.token_validity_hours <= 24
+    error_message = "token_validity_hours は 1〜24（Cognito が許す範囲）。"
+  }
+}
