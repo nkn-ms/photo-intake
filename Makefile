@@ -144,3 +144,53 @@ migrate:          ## マイグレーションの文をすべて順に流す
 	  $(MAKE) -s stmt-run N=$$n || exit 1; \
 	done; \
 	echo "--- 完了：$(MIGRATION) の文 $$total 個をすべて流した"
+
+# --- Cognito ---
+.PHONY: user token password
+
+# Cognito の規則を満たす強いパスワードを作り、画面に出さずにクリップボードへ入れる（AWS には触らない）。
+#   make password  → パスワードマネージャーに貼って保存 → make user / make token の入力にも貼る
+# ランダムな18バイトを文字にして、末尾に Aa1! を足す（大文字・小文字・数字・記号を必ず含めるため）。
+password:         ## 強いパスワードを作ってクリップボードに入れる
+	@printf '%s' "$$(openssl rand -base64 18)Aa1!" | pbcopy
+	@echo "クリップボードに入れました。パスワードマネージャーに貼って保存してください"
+
+# User Pool とアプリクライアントの ID は terraform output（手元の state）から取る。
+POOL   = $$($(TF) output -raw cognito_user_pool_id)
+CLIENT = $$($(TF) output -raw cognito_client_id)
+
+# ユーザーを1人作って、グループに入れる（admin だけがユーザーを作れる設定なので、管理者の権限で作る）。
+#   make user EMAIL=you@example.com GROUP=staff
+# パスワードは画面に出さずに入力させる（コマンドに書くとシェルの履歴に残るため）。
+# パスワードの規則は Cognito の既定：8文字以上で、大文字・小文字・数字・記号をそれぞれ1つ以上含む。
+#   --message-action SUPPRESS … 招待メールを送らない（CLI で作って、そのまま使うため）
+#   --permanent               … 「初回ログインでパスワードを変えさせる」状態にしない
+EMAIL ?= staff@example.com
+GROUP ?= staff
+user:             ## Cognito にユーザーを作ってグループに入れる
+	@test -n "$(EMAIL)" || { echo "EMAIL= を指定してください"; exit 1; }
+	@read -s -p "パスワード: " PW; echo; \
+	aws cognito-idp admin-create-user --user-pool-id "$(POOL)" --username "$(EMAIL)" \
+	  --user-attributes Name=email,Value="$(EMAIL)" Name=email_verified,Value=true \
+	  --message-action SUPPRESS >/dev/null && \
+	aws cognito-idp admin-set-user-password --user-pool-id "$(POOL)" --username "$(EMAIL)" \
+	  --password "$$PW" --permanent && \
+	aws cognito-idp admin-add-user-to-group --user-pool-id "$(POOL)" --username "$(EMAIL)" \
+	  --group-name "$(GROUP)" && \
+	echo "作成: $(EMAIL)（グループ: $(GROUP)）"
+
+# ログインしてトークンを受け取り、JWT の中身（真ん中の部分）を読める形で表示する。
+#   make token EMAIL=you@example.com
+# アクセストークンは .build/access_token に保存する（8b で API に付けて送る。.build/ は gitignore 済み）。
+# JWT は「ヘッダー.中身.署名」を . でつないだもの。中身は Base64 なので、暗号を解かなくても読める。
+DECODE_JWT = python3 -c "import sys,json,base64; p=sys.stdin.read().strip().split('.')[1]; print(json.dumps(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))),indent=2,ensure_ascii=False))"
+token:            ## ログインして JWT の中身を表示する
+	@test -n "$(EMAIL)" || { echo "EMAIL= を指定してください"; exit 1; }
+	@mkdir -p .build
+	@read -s -p "パスワード: " PW; echo; \
+	aws cognito-idp initiate-auth --client-id "$(CLIENT)" --auth-flow USER_PASSWORD_AUTH \
+	  --auth-parameters USERNAME="$(EMAIL)",PASSWORD="$$PW" --output json > .build/auth.json || exit 1; \
+	python3 -c "import json; r=json.load(open('.build/auth.json'))['AuthenticationResult']; open('.build/access_token','w').write(r['AccessToken']); open('.build/id_token','w').write(r['IdToken'])"; \
+	rm .build/auth.json; \
+	echo "--- ID トークンの中身"; $(DECODE_JWT) < .build/id_token; \
+	echo "--- アクセストークンの中身"; $(DECODE_JWT) < .build/access_token

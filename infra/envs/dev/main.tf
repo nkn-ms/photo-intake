@@ -688,3 +688,81 @@ output "db_cluster_arn" {
 output "db_secret_arn" {
   value = aws_rds_cluster.main.master_user_secret[0].secret_arn
 }
+
+# ---------------------------------------------------------------------------
+# Cognito（ログイン）
+# ---------------------------------------------------------------------------
+#
+# User Pool ＝ ユーザーの名簿と、ログインの窓口。
+# ログインに成功すると、Cognito は JWT（署名付きのトークン）を返す。
+# 中には「誰か（sub）」「どのグループか（cognito:groups）」「いつまで有効か」が書いてある。
+# API Gateway はこの JWT を確かめてから Lambda を呼ぶ（8b で作る）。
+#
+# 置いておくだけでは課金されない。少人数のユーザーなら無料枠の範囲。
+
+resource "aws_cognito_user_pool" "main" {
+  name = "photo-intake-dev"
+
+  # ログインに使う名前をメールアドレスにする（別に「ユーザー名」を決めさせない）
+  username_attributes = ["email"]
+
+  # ユーザーを作れるのは管理者だけ。自分で登録する機能（セルフサインアップ）は切る。
+  # 施設の職員だけが使う社内向けのシステムなので、誰でも登録できる必要がない。
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+  }
+
+  # 作り直す前提の学習環境なので、destroy で消せるようにしておく（本番では ACTIVE にする）
+  deletion_protection = "INACTIVE"
+}
+
+# グループ ＝ ユーザーに付ける札。
+# ユーザーがログインすると、所属するグループの名前が JWT の cognito:groups に入る。
+# API はそれを見て「確定（confirmed）にできるのは admin だけ」のように分ける（8d）。
+resource "aws_cognito_user_group" "staff" {
+  name         = "staff"
+  user_pool_id = aws_cognito_user_pool.main.id
+  description  = "拾得物を撮影して登録する職員"
+}
+
+resource "aws_cognito_user_group" "admin" {
+  name         = "admin"
+  user_pool_id = aws_cognito_user_pool.main.id
+  description  = "AI の結果を確認して確定する管理者"
+}
+
+# アプリクライアント ＝「このアプリからのログインを受け付ける」という登録。
+# 画面（ステップ9）も、8a で試す CLI も、この ID を使ってログインする。
+resource "aws_cognito_user_pool_client" "web" {
+  name         = "photo-intake-dev-web"
+  user_pool_id = aws_cognito_user_pool.main.id
+
+  # シークレット（秘密の鍵）を持たせない。
+  # ブラウザで動く画面に秘密を入れても、開発者ツールで誰でも見られるので意味がない。
+  generate_secret = false
+
+  # 受け付けるログインの方式
+  explicit_auth_flows = [
+    # SRP：パスワードそのものを送らずに、「知っている」ことだけを証明する方式。画面ではこちらを使う
+    "ALLOW_USER_SRP_AUTH",
+    # パスワードを（HTTPS で暗号化して）そのまま送る方式。CLI から試すのが簡単なので、学習用に開けている
+    "ALLOW_USER_PASSWORD_AUTH",
+    # リフレッシュトークンで、ログインし直さずにトークンを取り直す
+    "ALLOW_REFRESH_TOKEN_AUTH",
+  ]
+
+  # 「そのユーザーはいない」と「パスワードが違う」を同じエラーにする。
+  # 分けると、どのメールアドレスが登録されているかを外から調べられてしまう。
+  prevent_user_existence_errors = "ENABLED"
+
+  # トークンの有効期限は既定のまま（ID・アクセストークン 1時間、リフレッシュトークン 30日）
+}
+
+# CLI でユーザーを作ったりログインしたりするときに使う
+output "cognito_user_pool_id" {
+  value = aws_cognito_user_pool.main.id
+}
+
+output "cognito_client_id" {
+  value = aws_cognito_user_pool_client.web.id
+}
