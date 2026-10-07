@@ -218,3 +218,17 @@ build-api:        ## API の Lambda に載せるものを .build/api に集め�
 	  -r .build/api-requirements.txt
 	@if ls backend/api/*.py >/dev/null 2>&1; then cp backend/api/*.py $(API_BUILD)/; fi
 	@echo "組み立て完了: $(API_BUILD)（$$(du -sh $(API_BUILD) | cut -f1)）"
+
+# API Gateway を通さずに、API の Lambda を直接1回呼ぶ（8b-3 の確認用）。
+#   make invoke-api            → GET /health
+#   make invoke-api ROUTE=/me  → GET /me（API Gateway を通っていないので 401 になるのが正しい）
+# event は API Gateway（HTTP API）が送ってくる形を、最小限だけ真似たもの。
+# Lambda の上で pydantic_core（Lambda 用の機械語）が読み込めるか、の確認にもなる。
+.PHONY: invoke-api
+ROUTE ?= /health
+invoke-api:       ## API の Lambda を直接呼ぶ（API Gateway を通さない）
+	@mkdir -p .build
+	@aws lambda invoke --function-name photo-intake-dev-api --cli-binary-format raw-in-base64-out \
+	  --payload '{"version":"2.0","routeKey":"GET $(ROUTE)","rawPath":"$(ROUTE)","rawQueryString":"","headers":{"host":"local"},"requestContext":{"http":{"method":"GET","path":"$(ROUTE)","protocol":"HTTP/1.1","sourceIp":"127.0.0.1","userAgent":"make"},"stage":"$$default"},"isBase64Encoded":false}' \
+	  .build/invoke.json >/dev/null
+	@cat .build/invoke.json; echo

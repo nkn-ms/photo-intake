@@ -777,3 +777,71 @@ output "cognito_user_pool_id" {
 output "cognito_client_id" {
   value = aws_cognito_user_pool_client.web.id
 }
+
+# ---------------------------------------------------------------------------
+# API の Lambda（FastAPI）
+# ---------------------------------------------------------------------------
+#
+# 中身は backend/api/app.py と、FastAPI などのライブラリ。
+# make build-api がそれを .build/api に集め、ここで zip にする（make plan / apply の前に自動で走る）。
+# 呼ぶのは API Gateway（8b-4 で作る）。worker と違って、SQS ではなく HTTP のリクエストで起動する。
+
+# 実行ロール。形は worker のロールと同じ（信頼ポリシー：Lambda サービスが引き受けてよい）。
+# worker とは分ける。API と worker はやることが違うので、与える権限も違う（最小権限）。
+resource "aws_iam_role" "api" {
+  name = "photo-intake-dev-api"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# 【権限ポリシー】今はログを書くことだけ。/health も /me も AWS の何にも触らないため。
+# 8c で「items に行を作る（Data API）」「署名付きURLを出す（S3）」を足す。
+# 必要になった権限を、必要になったときに足す。
+resource "aws_iam_role_policy_attachment" "api_logs" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# worker は handler.py 1ファイルだったので source_file。API はライブラリごとなのでフォルダ（source_dir）。
+data "archive_file" "api" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../../.build/api"
+  output_path = "${path.module}/.build/api.zip"
+}
+
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/aws/lambda/photo-intake-dev-api"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "api" {
+  function_name = "photo-intake-dev-api"
+  role          = aws_iam_role.api.arn
+
+  filename         = data.archive_file.api.output_path
+  source_code_hash = data.archive_file.api.output_base64sha256
+
+  runtime = "python3.12"
+  handler = "app.handler" # app.py の handler（Mangum）
+
+  # CPU の種類。make build-api が x86_64 用のライブラリを入れているので、ここも揃える（Lambda の既定も x86_64）。
+  # 揃っていないと、起動した瞬間に pydantic_core が読み込めずに落ちる。
+  architectures = ["x86_64"]
+
+  # 画面の操作に応える API なので、数秒で返すべき。長く待たせても良いことがない。
+  # （API Gateway の HTTP API は、そもそも30秒で打ち切る）
+  timeout = 10
+
+  # Lambda はメモリに比例して CPU も増える。FastAPI と Pydantic の読み込み（コールドスタート）を速くするため、
+  # worker（256）より多めにしている。使った時間 × メモリで課金されるが、手で試す程度なら誤差。
+  memory_size = 512
+
+  depends_on = [aws_cloudwatch_log_group.api]
+}
