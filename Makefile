@@ -24,13 +24,15 @@ validate:        ## 文法と参照が正しいか検査する
 init:            ## provider を用意する（npm install に近い）
 	$(TF) init
 
-plan:            ## 何が変わるかを表示するだけ。変更しない
+# plan / apply / destroy の前に、API の Lambda の zip の中身（.build/api）を組み立てる。
+# Terraform は plan の時点でそのフォルダを読んで zip にするので、無いと失敗する。
+plan: build-api  ## 何が変わるかを表示するだけ。変更しない
 	$(TF) plan
 
-apply:           ## 実際に AWS に反映する。yes の入力を求められる
+apply: build-api ## 実際に AWS に反映する。yes の入力を求められる
 	$(TF) apply
 
-destroy:         ## 作ったものを消す
+destroy: build-api ## 作ったものを消す
 	$(TF) destroy
 
 # --- 動作確認用 ---
@@ -84,7 +86,7 @@ resend:           ## S3 の通知と同じ形のメッセージを手で送る
 
 # Data API で SQL を1本送る。
 #   make sql SQL="select version()"
-# ARN は terraform output（手元の state）から取るので、ここでは AWS に触らない。
+# ARN は terraform output（ローカルの state）から取るので、ここでは AWS に触らない。
 # 一時停止中だと DatabaseResumingException が返るので、十数秒おいて打ち直す。
 SQL ?= select 1
 sql:              ## Data API で SQL を1本送る
@@ -155,7 +157,7 @@ password:         ## 強いパスワードを作ってクリップボードに�
 	@printf '%s' "$$(openssl rand -base64 18)Aa1!" | pbcopy
 	@echo "クリップボードに入れました。パスワードマネージャーに貼って保存してください"
 
-# User Pool とアプリクライアントの ID は terraform output（手元の state）から取る。
+# User Pool とアプリクライアントの ID は terraform output（ローカルの state）から取る。
 POOL   = $$($(TF) output -raw cognito_user_pool_id)
 CLIENT = $$($(TF) output -raw cognito_client_id)
 
@@ -194,3 +196,25 @@ token:            ## ログインして JWT の中身を表示する
 	rm .build/auth.json; \
 	echo "--- ID トークンの中身"; $(DECODE_JWT) < .build/id_token; \
 	echo "--- アクセストークンの中身"; $(DECODE_JWT) < .build/access_token
+
+# --- API の Lambda の組み立て ---
+.PHONY: build-api
+
+# API の Lambda に載せるもの（自分のコード＋FastAPI などのライブラリ）を .build/api に集める。
+# Terraform（archive_file）がこのフォルダを zip にして Lambda に上げる。AWS には触らない。
+#
+# ① pyproject.toml の api グループの、uv.lock で決まった版の一覧を書き出す
+# ② その一覧を「Lambda 用（Linux・x86_64・Python 3.12）」の版で .build/api に入れる。
+#    Pydantic の中身（pydantic-core）は機械語に変換済みの部品で、Mac 用の版は Lambda では動かないため。
+#    --only-binary :all: … 変換済みの版だけを使う（ローカルで変換し始めて、Mac 用ができてしまうのを防ぐ）
+# ③ 自分のコード（backend/api/*.py）を同じフォルダに入れる
+# 毎回フォルダを消して作り直す（前回の残りが紛れ込まないように）。
+API_BUILD = .build/api
+build-api:        ## API の Lambda に載せるものを .build/api に集める
+	@rm -rf $(API_BUILD) && mkdir -p $(API_BUILD)
+	@cd backend && uv export --quiet --only-group api --no-hashes --format requirements-txt > ../.build/api-requirements.txt
+	@uv pip install --quiet --target $(API_BUILD) \
+	  --python-platform x86_64-manylinux2014 --python-version 3.12 --only-binary :all: \
+	  -r .build/api-requirements.txt
+	@if ls backend/api/*.py >/dev/null 2>&1; then cp backend/api/*.py $(API_BUILD)/; fi
+	@echo "組み立て完了: $(API_BUILD)（$$(du -sh $(API_BUILD) | cut -f1)）"

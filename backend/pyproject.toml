@@ -2,17 +2,23 @@
 name = "photo-intake-backend"
 version = "0.1.0"
 requires-python = ">=3.12"
+# Lambda 側に最初からあるもの。zip には入れない。
+#   boto3                 … Lambda の Python に最初から入っている
+#   aws-lambda-powertools … 公式のレイヤーで載せている（main.tf）
+# ローカルで動かす・テストするために、ここに書いて入れておく。
 dependencies = [
+    "boto3",
+    "aws-lambda-powertools",
+]
+
+[dependency-groups]
+# API の Lambda に一緒に載せるもの（Lambda には入っていない）。make build-api がこれだけを zip に入れる。
+api = [
     "fastapi",
     "mangum",
     "pydantic>=2",
-    "boto3",
-    "aws-lambda-powertools[tracer]",
 ]
-
 # 開発のときだけ使うもの（package.json の devDependencies に当たる）。Lambda には載せない。
-# uv sync は dev グループを既定で入れる。
-[dependency-groups]
 dev = [
     "pytest",
     # 偽物にするサービスだけを指定する。moto[all] は全サービス分の依存（Docker 関連など）まで入って重い。
@@ -22,7 +28,12 @@ dev = [
     "ruff",
     "httpx",
     "types-boto3[bedrock-runtime,rds-data,s3]>=1.43.108",
+    "uvicorn>=0.54.0",
 ]
+
+[tool.uv]
+# uv sync で入れるグループ。ローカルでは API のライブラリも使う（動かす・テストする）ので api も入れる
+default-groups = ["dev", "api"]
 
 [tool.pytest.ini_options]
 # テストから import handler で worker/handler.py を読めるようにする。
@@ -35,7 +46,7 @@ python_version = "3.12"
 strict = true
 # uv run mypy だけで検査できるように、対象を書いておく。
 # tests/ は入れない（偽物の関数や monkeypatch に型を付けても、得られるものが少ない）
-files = ["worker"]
+files = ["worker", "api"]
 
 [tool.ruff]
 line-length = 100

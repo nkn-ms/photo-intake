@@ -10,7 +10,7 @@ backend.hcl
 .build/
 # .terraform.lock.hcl は意図的にコミットする。
 # provider のバージョンをチーム全員と CI で固定するためのファイルなので、
-# gitignore すると環境ごとに別バージョンが入り「手元では通るのに CI で落ちる」が起きる。
+# gitignore すると環境ごとに別バージョンが入り「ローカルでは通るのに CI で落ちる」が起きる。
 
 # Python
 __pycache__/
