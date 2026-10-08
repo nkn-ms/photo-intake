@@ -40,28 +40,42 @@ def get_current_user(request: Request) -> User:
     FastAPI がルートの関数より先にこれを呼んで、結果を渡してくれる（依存性の注入）。
     """
     claims = read_claims(request)
+    if claims is None:
+        raise HTTPException(
+            status_code=401, detail="認証されていない（API Gateway を通っていない）"
+        )
+    if not is_access_token(claims):
+        raise HTTPException(status_code=401, detail="アクセストークンを送ってください")
     return User(sub=claims["sub"], groups=parse_groups(claims.get("cognito:groups", "")))
 
 
 # --- 部品 ---
 
 
-def read_claims(request: Request) -> dict[str, Any]:
-    """API Gateway が確かめ済みの JWT の中身を、event から取り出す。
+def read_claims(request: Request) -> dict[str, Any] | None:
+    """API Gateway が確かめ済みの JWT の中身を、event から取り出す。無ければ None。
 
     event の形（HTTP API の JWT オーソライザーを通った場合）:
         {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": "...", ...}}}}}
 
-    無ければ 401。ローカルで動かしたとき（API Gateway が前にいない）は、ここに来る。
+    ローカルで動かしたとき（API Gateway が前にいない）や、認証なしのルートから呼ばれたときは None になる。
     """
     event = request.scope.get("aws.event")
     try:
         claims: dict[str, Any] = event["requestContext"]["authorizer"]["jwt"]["claims"]  # type: ignore[index]
     except (TypeError, KeyError):
-        raise HTTPException(
-            status_code=401, detail="認証されていない（API Gateway を通っていない）"
-        )
+        return None
     return claims
+
+
+def is_access_token(claims: dict[str, Any]) -> bool:
+    """アクセストークンなら True、それ以外（ID トークンなど）なら False。
+
+    API Gateway のオーソライザーは iss・aud（または client_id）・署名・期限しか見ないので、
+    ID トークン（aud がアプリの ID）でも通してしまう。API が受け付けるのはアクセストークンだけにする。
+    ID トークンは画面が「誰がログインしたか」を知るためのもので、API に送るものではない。
+    """
+    return claims.get("token_use") == "access"
 
 
 def parse_groups(raw: str) -> list[str]:
