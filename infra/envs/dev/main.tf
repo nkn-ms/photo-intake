@@ -830,22 +830,23 @@ resource "aws_iam_role_policy" "api_db" {
   })
 }
 
-# 【権限ポリシー】uploads/ の下に写真を置く（8c）。
+# 【権限ポリシー】uploads/ の下に写真を置く（8c）・写真を読む（8d）。
 #
-# API 自身は写真を置かない。それでもこの権限が要るのは、署名付きURLの仕組みのため:
+# API 自身は写真を置きも読みもしない。それでもこの権限が要るのは、署名付きURLの仕組みのため:
 #   ・API は「uploads/xxx.jpg に PUT してよい」という URL を、自分の権限で署名して作る（AWS には問い合わせない）
 #   ・ブラウザ（今は curl）がその URL に PUT したとき、S3 は「署名した者（このロール）に PutObject の権限があるか」を確かめる
 # つまり署名付きURLは、このロールの権限を、URL を持つ人に5分だけ貸し出すもの。
+# 詳細（GET /items/{id}）で返す「写真を見るための URL」も同じで、こちらは GetObject を貸し出す。
 # だから範囲を uploads/ の下だけに絞っておく（貸し出せるのも uploads/ の下だけになる）。
 resource "aws_iam_role_policy" "api_s3" {
-  name = "put-uploads"
+  name = "put-get-uploads"
   role = aws_iam_role.api.name
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = "s3:PutObject"
+      Action   = ["s3:PutObject", "s3:GetObject"]
       Resource = "${aws_s3_bucket.uploads.arn}/uploads/*"
     }]
   })
