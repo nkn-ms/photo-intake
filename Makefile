@@ -221,7 +221,8 @@ token:            ## ログインして JWT の中身を表示する
 # ② その一覧を「Lambda 用（Linux・x86_64・Python 3.12）」の版で .build/api に入れる。
 #    Pydantic の中身（pydantic-core）は機械語に変換済みの部品で、Mac 用の版は Lambda では動かないため。
 #    --only-binary :all: … 変換済みの版だけを使う（ローカルで変換し始めて、Mac 用ができてしまうのを防ぐ）
-# ③ 自分のコード（backend/api/*.py）を同じフォルダに入れる
+# ③ 自分のコード（backend/api の中身。routers/ などのフォルダごと）を同じフォルダに入れる。
+#    __pycache__（ローカルの Python が作るキャッシュ）は載せない
 # 毎回フォルダを消して作り直す（前回の残りが紛れ込まないように）。
 API_BUILD = .build/api
 build-api:        ## API の Lambda に載せるものを .build/api に集める
@@ -230,7 +231,7 @@ build-api:        ## API の Lambda に載せるものを .build/api に集め�
 	@uv pip install --quiet --target $(API_BUILD) \
 	  --python-platform x86_64-manylinux2014 --python-version 3.12 --only-binary :all: \
 	  -r .build/api-requirements.txt
-	@if ls backend/api/*.py >/dev/null 2>&1; then cp backend/api/*.py $(API_BUILD)/; fi
+	@rsync -a --exclude '__pycache__' backend/api/ $(API_BUILD)/
 	@echo "組み立て完了: $(API_BUILD)（$$(du -sh $(API_BUILD) | cut -f1)）"
 
 # API Gateway を通さずに、API の Lambda を直接1回呼ぶ（8b-3 の確認用）。

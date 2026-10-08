@@ -50,3 +50,6 @@ files = ["worker", "api"]
 
 [tool.ruff]
 line-length = 100
+# 自分のコードの置き場所。ここにある auth・db・routers などを「自分のコード」として、
+# import の並びで外部ライブラリ（fastapi など）の後ろに分けて置く
+src = ["api", "worker"]
