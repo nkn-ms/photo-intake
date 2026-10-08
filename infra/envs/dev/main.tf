@@ -801,12 +801,54 @@ resource "aws_iam_role" "api" {
   })
 }
 
-# 【権限ポリシー】今はログを書くことだけ。/health も /me も AWS の何にも触らないため。
-# 8c で「items に行を作る（Data API）」「署名付きURLを出す（S3）」を足す。
-# 必要になった権限を、必要になったときに足す。
+# 【権限ポリシー】ログを書く（全 Lambda に共通。AWS 既製のもの）。
+# 必要になった権限を、必要になったときに足す（8c で下の2つを足した）。
 resource "aws_iam_role_policy_attachment" "api_logs" {
   role       = aws_iam_role.api.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# 【権限ポリシー】Data API で items に行を作る（8c）。worker の query-db と同じ2つ。
+resource "aws_iam_role_policy" "api_db" {
+  name = "query-db"
+  role = aws_iam_role.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "rds-data:ExecuteStatement"
+        Resource = aws_rds_cluster.main.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = aws_rds_cluster.main.master_user_secret[0].secret_arn
+      },
+    ]
+  })
+}
+
+# 【権限ポリシー】uploads/ の下に写真を置く（8c）。
+#
+# API 自身は写真を置かない。それでもこの権限が要るのは、署名付きURLの仕組みのため:
+#   ・API は「uploads/xxx.jpg に PUT してよい」という URL を、自分の権限で署名して作る（AWS には問い合わせない）
+#   ・ブラウザ（今は curl）がその URL に PUT したとき、S3 は「署名した者（このロール）に PutObject の権限があるか」を確かめる
+# つまり署名付きURLは、このロールの権限を、URL を持つ人に5分だけ貸し出すもの。
+# だから範囲を uploads/ の下だけに絞っておく（貸し出せるのも uploads/ の下だけになる）。
+resource "aws_iam_role_policy" "api_s3" {
+  name = "put-uploads"
+  role = aws_iam_role.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:PutObject"
+      Resource = "${aws_s3_bucket.uploads.arn}/uploads/*"
+    }]
+  })
 }
 
 # worker は handler.py 1ファイルだったので source_file。API はライブラリごとなのでフォルダ（source_dir）。
@@ -835,13 +877,25 @@ resource "aws_lambda_function" "api" {
   # 揃っていないと、起動した瞬間に pydantic_core が読み込めずに落ちる。
   architectures = ["x86_64"]
 
-  # 画面の操作に応える API なので、数秒で返すべき。長く待たせても良いことがない。
-  # （API Gateway の HTTP API は、そもそも30秒で打ち切る）
-  timeout = 10
+  # ふだんは1秒もかからない。長いのは DB が一時停止から起きるのを待つときだけ（app.py で最大20秒待つ）。
+  # API Gateway の HTTP API は30秒で打ち切るので、その手前の28秒にしておく。
+  timeout = 28
 
   # Lambda はメモリに比例して CPU も増える。FastAPI と Pydantic の読み込み（コールドスタート）を速くするため、
   # worker（256）より多めにしている。使った時間 × メモリで課金されるが、手で試す程度なら誤差。
   memory_size = 512
+
+  environment {
+    variables = {
+      # Data API に渡す3点セット（worker と同じもの）
+      DB_CLUSTER_ARN = aws_rds_cluster.main.arn
+      DB_SECRET_ARN  = aws_rds_cluster.main.master_user_secret[0].secret_arn
+      DB_NAME        = aws_rds_cluster.main.database_name
+
+      # 署名付きURLで写真を置かせるバケット
+      UPLOAD_BUCKET = aws_s3_bucket.uploads.bucket
+    }
+  }
 
   depends_on = [aws_cloudwatch_log_group.api]
 }
