@@ -71,6 +71,20 @@ peek:             ## 本体キューと DLQ の中身を覗く（消さない）
 purge:            ## キューを空にする
 	aws sqs purge-queue --queue-url $(QUEUE)
 
+# バケットの中身を全部消す。バケット自体は残る（消すのは make destroy）。
+# destroy の前に使う。中身が残っていると Terraform はバケットを消せない。
+# バージョニングを切っているので、消したファイルは戻せない。先に一覧を出し、yes と打ったときだけ消す。
+# DB の items の行は残る（写真だけが消え、行と合わなくなる）。
+.PHONY: empty-bucket
+empty-bucket:     ## S3 の中身を全部消す（一覧を見せ、yes で実行）
+	@b=$(BUCKET); \
+	n=$$(aws s3 ls "s3://$$b/" --recursive | wc -l | tr -d ' '); \
+	if [ "$$n" = 0 ]; then echo "s3://$$b は空です"; exit 0; fi; \
+	aws s3 rm "s3://$$b/" --recursive --dryrun; \
+	read -p "上の $$n 件を消します。よければ yes: " ans; \
+	[ "$$ans" = yes ] || { echo "やめました"; exit 0; }; \
+	aws s3 rm "s3://$$b/" --recursive
+
 # S3 の通知と同じ形のメッセージを、手で SQS に送る。重複配信（同じ通知が2回届く）の再現用。
 #   make resend KEY=uploads/wallet.jpg
 # worker が読むのは bucket.name と object.key だけなので、それだけ入れている。
@@ -250,3 +264,32 @@ call:             ## API Gateway の URL に curl でリクエストを出す
 	else \
 	  curl -s -i -H "Authorization: Bearer $$(cat .build/$(TOKEN)_token)" "$(API_URL)$(patsubst /%,%,$(ROUTE))"; \
 	fi; echo
+
+# 写真を登録する（8c）。画面がやることを、curl で順にやる。
+#   make register FILE=wallet.jpg
+# ① POST /items（アクセストークンを付けて）→ API が items に行を作り、署名付きURLを返す
+# ② その URL に写真を PUT する（API は通らない。S3 に直接）。Content-Type は①で渡したものと同じにする
+# ③ あとは S3 → SQS → worker が動く。make items で status が analyzing → pending_review に変わるのを見る
+# 拡張子から Content-Type を決める。API が受け付けない形式なら、ここで止める。
+.PHONY: register items
+register:         ## 写真を登録する（POST /items → 署名付きURLに PUT）
+	@test -f "$(FILE)" || { echo "FILE= に写真を指定してください"; exit 1; }
+	@case "$$(echo '$(FILE)' | tr 'A-Z' 'a-z')" in \
+	  *.jpg|*.jpeg) ct=image/jpeg ;; *.png) ct=image/png ;; *.webp) ct=image/webp ;; *.gif) ct=image/gif ;; \
+	  *) echo "対応していない形式です（jpg / png / webp / gif）"; exit 1 ;; \
+	esac; \
+	echo "--- ① POST /items（$${ct}）"; \
+	curl -s -X POST -H "Authorization: Bearer $$(cat .build/access_token)" -H "Content-Type: application/json" \
+	  -d "{\"content_type\": \"$$ct\"}" "$(API_URL)items" | tee .build/register.json; echo; \
+	url=$$(python3 -c "import json; print(json.load(open('.build/register.json'))['upload_url'])") || exit 1; \
+	echo "--- ② PUT（署名付きURLへ）"; \
+	curl -s -o /dev/null -w "HTTP %{http_code}\n" -X PUT -H "Content-Type: $$ct" --upload-file "$(FILE)" "$$url"
+
+# 最近登録した行を5件見る（Data API。--format-records-as JSON で列名付きの JSON にする）
+items:            ## 最近登録した items を5件表示する
+	@aws rds-data execute-statement \
+	  --resource-arn "$$($(TF) output -raw db_cluster_arn)" \
+	  --secret-arn "$$($(TF) output -raw db_secret_arn)" \
+	  --database photo_intake --format-records-as JSON \
+	  --sql "select id, status, s3_key, registered_by, ai_model, created_at from items order by created_at desc limit 5" \
+	  --query formattedRecords --output text | python3 -m json.tool --no-ensure-ascii
