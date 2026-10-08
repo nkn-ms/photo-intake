@@ -232,3 +232,21 @@ invoke-api:       ## API の Lambda を直接呼ぶ（API Gateway を通さな�
 	  --payload '{"version":"2.0","routeKey":"GET $(ROUTE)","rawPath":"$(ROUTE)","rawQueryString":"","headers":{"host":"local"},"requestContext":{"http":{"method":"GET","path":"$(ROUTE)","protocol":"HTTP/1.1","sourceIp":"127.0.0.1","userAgent":"make"},"stage":"$$default"},"isBase64Encoded":false}' \
 	  .build/invoke.json >/dev/null
 	@cat .build/invoke.json; echo
+
+# API Gateway の URL に curl でリクエストを出す（8b-4 から）。
+#   make call                  → GET /me に、make token で保存したアクセストークンを付けて出す
+#   make call ROUTE=/health    → GET /health（認証なしのルート）
+#   make call TOKEN=none       → トークンを付けない → 401 になるのが正しい
+#   make call TOKEN=id         → ID トークンを付ける → API Gateway は通すが、app.py が 401 で弾く
+# -i … ステータス行やヘッダーも表示する
+# api_url は末尾が / なので、ROUTE の先頭の / を外してつなぐ。
+.PHONY: call
+API_URL = $$($(TF) output -raw api_url)
+TOKEN ?= access
+call: ROUTE = /me
+call:             ## API Gateway の URL に curl でリクエストを出す
+	@if [ "$(TOKEN)" = none ]; then \
+	  curl -s -i "$(API_URL)$(patsubst /%,%,$(ROUTE))"; \
+	else \
+	  curl -s -i -H "Authorization: Bearer $$(cat .build/$(TOKEN)_token)" "$(API_URL)$(patsubst /%,%,$(ROUTE))"; \
+	fi; echo

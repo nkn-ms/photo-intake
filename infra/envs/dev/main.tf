@@ -845,3 +845,112 @@ resource "aws_lambda_function" "api" {
 
   depends_on = [aws_cloudwatch_log_group.api]
 }
+
+# ---------------------------------------------------------------------------
+# API Gateway（HTTP API）
+# ---------------------------------------------------------------------------
+#
+# 公開の入口。URL を持ち、届いたリクエストを API の Lambda に渡す。
+# 部品は5つ。HTTP のリクエストは上から順に通る:
+#
+#   api         … 入口そのもの（URL の持ち主）
+#   stage       … 公開の単位。URL の末尾が決まる。$default にすると URL に段階名が付かない
+#   route       … 「どのメソッド・パスのリクエストを、どう扱うか」。認証の有無もここで決める
+#   authorizer  … route に付ける「JWT の検査係」。通らなければ 401 で、Lambda は呼ばれない
+#   integration … route の行き先（この Lambda に渡す）
+#
+# 置いておくだけでは課金されない。100万リクエストあたり約1ドル。
+
+resource "aws_apigatewayv2_api" "main" {
+  name          = "photo-intake-dev"
+  protocol_type = "HTTP" # HTTP API（新しく安いほう）。REST API ではない
+
+  # CORS（別のドメインの画面からの呼び出しを許す設定）は、画面を作るステップ9で足す。
+  # 今は curl から呼ぶだけなので要らない。
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.main.id
+  name        = "$default" # URL の末尾に段階名（/dev など）を付けない
+  auto_deploy = true       # route などを変えたら自動で公開し直す（手で「デプロイ」しなくてよい）
+
+  # 流量の上限（スロットリング）。超えた分は Lambda を呼ばずに 429 で返す。
+  # 公開の URL なので、誰かに連打されても Lambda の課金が膨らまないようにする保険。
+  # rate＝1秒あたりの平均、burst＝一瞬だけ許す量。手で試す分には十分大きい。
+  default_route_settings {
+    throttling_rate_limit  = 10
+    throttling_burst_limit = 20
+  }
+}
+
+# JWT の検査係。Cognito（8a）が発行したトークンだけを通す。
+#   identity_sources … トークンをどこから取り出すか（Authorization ヘッダー。"Bearer <トークン>" の形）
+#   issuer           … JWT の iss がこれと一致するか（うちの User Pool が発行したか）
+#   audience         … JWT の aud（アクセストークンでは client_id）がこれと一致するか（うちのアプリ向けか）
+# 署名と期限（exp）も確かめる。検査は API Gateway の中で済み、Cognito には問い合わせない
+# （だから速いが、発行後のトークンを取り消せない。トークンの期限を短くする理由）。
+resource "aws_apigatewayv2_authorizer" "cognito" {
+  api_id           = aws_apigatewayv2_api.main.id
+  name             = "cognito"
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+
+  jwt_configuration {
+    issuer   = "https://${aws_cognito_user_pool.main.endpoint}"
+    audience = [aws_cognito_user_pool_client.web.id]
+  }
+}
+
+# 行き先：API の Lambda。
+#   AWS_PROXY … リクエストを丸ごと event にして Lambda に渡し、Lambda の戻り値をそのまま HTTP のレスポンスにする
+#   2.0       … event の形の版。app.py（Mangum）と make invoke-api が前提にしている形
+resource "aws_apigatewayv2_integration" "api" {
+  api_id                 = aws_apigatewayv2_api.main.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
+}
+
+# ルートは2本だけにする:
+#   GET /health      … 認証なし（生きているかの確認用）
+#   ANY /{proxy+}    … それ以外すべて。JWT 必須
+# 「既定で認証必須、例外だけを開ける」形。FastAPI にルートを足しても、ここを書き換える必要がなく、
+# 書き忘れて認証なしで公開してしまうこともない。どのパスがあるかは FastAPI（app.py）が決める。
+resource "aws_apigatewayv2_route" "health" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /health"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+  # authorization_type を書かない＝NONE（認証なし）
+}
+
+resource "aws_apigatewayv2_route" "authenticated" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "ANY /{proxy+}" # {proxy+} は「どんなパスでも」。ANY は「どのメソッドでも」
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# ★リソースベースのポリシー：「この API Gateway は、この Lambda を呼んでよい」
+#
+# API Gateway は、Lambda を呼ぶときにロール（帽子）をかぶらない。
+# だから呼ばれる側の Lambda の入口に、名簿として書く（SQS のキューポリシーと同じ考え方）。
+#
+#   principal  … 誰に許すか（API Gateway というサービス）
+#   source_arn … ★そのうち、どの API からの呼び出しか。これで「この API だけ」に絞る。
+#                書かないと「API Gateway なら、どの API からでも（他人のアカウントの API でも）」になる。
+#                /*/* は「どのステージの、どのルートからでも」
+#
+# これが無いと、API Gateway が Lambda を呼んだ瞬間に拒否され、curl には 500 が返る。
+resource "aws_lambda_permission" "api_gateway" {
+  statement_id  = "AllowInvokeFromApiGateway" # 名簿の1行の名前（コンソールに出る）
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
+}
+
+output "api_url" {
+  value = aws_apigatewayv2_stage.default.invoke_url
+}
