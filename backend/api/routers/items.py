@@ -1,4 +1,4 @@
-"""拾得物（items）のルート。登録（8c）・一覧と詳細（8d-1）。確定は 8d-2 で足す。"""
+"""拾得物（items）のルート。登録（8c）・一覧と詳細（8d-1）・確定（8d-2）。"""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from typing import Annotated, Any, Literal
 import boto3
 from botocore.config import Config
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import AfterValidator, BaseModel
+from pydantic import AfterValidator, BaseModel, Field
 
-from auth import User, get_current_user
-from db import execute_sql, select_rows
+from auth import User, get_current_user, require_admin
+from db import execute_sql, select_rows, text_or_null
 
 # ルートの入れ物。app.py が app.include_router(items.router) でアプリにつなぐ
 router = APIRouter()
@@ -133,9 +133,9 @@ def make_upload_key(content_type: str) -> str:
 
 
 INSERT_ITEM_SQL = """
-insert into items (s3_key, registered_by, registered_at, location)
-values (:s3_key, :registered_by, cast(:registered_at as timestamptz), :location)
-returning id
+INSERT INTO items (s3_key, registered_by, registered_at, location)
+VALUES (:s3_key, :registered_by, CAST(:registered_at AS TIMESTAMPTZ), :location)
+RETURNING id
 """
 
 
@@ -149,13 +149,7 @@ def insert_item(s3_key: str, registered_by: str, new_item: NewItem) -> str:
             {"name": "registered_by", "value": {"stringValue": registered_by}},
             # Data API に日時の型を直接渡すと書式の決まりが細かいので、文字列で渡して SQL の側で変換する
             {"name": "registered_at", "value": {"stringValue": registered_at.isoformat()}},
-            # 拾得場所は任意。無ければ NULL を入れる
-            {
-                "name": "location",
-                "value": {"stringValue": new_item.location}
-                if new_item.location is not None
-                else {"isNull": True},
-            },
+            {"name": "location", "value": text_or_null(new_item.location)},  # 任意。無ければ NULL
         ],
     )
     # returning id の結果。1行目の1列目
@@ -214,29 +208,21 @@ def list_items(status: ItemStatus | None = None) -> list[ItemSummary]:
 # --- 部品 ---
 
 # ai_result->>'category'：jsonb の中の "category" を文字列で取り出す（PostgreSQL の書き方）。
-# cast(:status as text) is null：絞り込みが無ければ（null なら）全件。
-#   cast が無いと、PostgreSQL が「null の型が分からない」と言って失敗する。
+# CAST(:status AS TEXT) IS NULL：絞り込みが無ければ（null なら）全件。
+#   CAST が無いと、PostgreSQL が「null の型が分からない」と言って失敗する。
 SELECT_ITEMS_SQL = f"""
-select id, status, category, ai_result->>'category' as ai_category,
+SELECT id, status, category, ai_result->>'category' AS ai_category,
        location, registered_at, created_at
-from items
-where cast(:status as text) is null or status = cast(:status as text)
-order by registered_at desc
-limit {LIST_LIMIT}
+FROM items
+WHERE CAST(:status AS TEXT) IS NULL OR status = CAST(:status AS TEXT)
+ORDER BY registered_at DESC
+LIMIT {LIST_LIMIT}
 """
 
 
 def select_items(status: str | None) -> list[dict[str, Any]]:
     """一覧の行を読む。"""
-    return select_rows(
-        SELECT_ITEMS_SQL,
-        [
-            {
-                "name": "status",
-                "value": {"stringValue": status} if status is not None else {"isNull": True},
-            }
-        ],
-    )
+    return select_rows(SELECT_ITEMS_SQL, [{"name": "status", "value": text_or_null(status)}])
 
 
 # ===========================================================================
@@ -264,7 +250,7 @@ class ItemDetail(BaseModel):
     category: str | None
     color: str | None
     brand: str | None
-    features: str | None
+    features: list[str] | None  # AI の features と同じ配列の形（002 で jsonb に変えた）
     confirmed_by: str | None
     confirmed_at: UtcDatetime | None
     retention_deadline: date | None  # 保管期限（拾得日 + 3か月）
@@ -285,40 +271,53 @@ def get_item(item_id: uuid.UUID) -> ItemDetail:
 
     item_id を uuid.UUID 型にしているので、UUID の形でなければ FastAPI が 422 で弾く（DB まで行かない）。
     """
-    rows = select_item(item_id)
-    if not rows:
+    row = select_item(item_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="その拾得物は見つかりません")
-    row = rows[0]
-    ai_result = parse_ai_result(row["ai_result"])
-    photo_url = make_photo_url(row["s3_key"])
-    # 読んだ列に、加工した2つを上書きして渡す。ItemDetail に無い列（s3_key）は Pydantic が捨てる
-    return ItemDetail.model_validate({**row, "ai_result": ai_result, "photo_url": photo_url})
+    return to_item_detail(row)
 
 
 # --- 部品 ---
 
 # embedding（1024個の数字）は画面で使わないので読まない
 SELECT_ITEM_SQL = """
-select id, status, s3_key, registered_at, location, registered_by,
+SELECT id, status, s3_key, registered_at, location, registered_by,
        ai_result, ai_model, ai_analyzed_at, ai_error,
        category, color, brand, features, confirmed_by, confirmed_at, retention_deadline,
        police_reported_at, matched_request_id, matched_at, created_at, updated_at
-from items
-where id = cast(:id as uuid)
+FROM items
+WHERE id = CAST(:id AS UUID)
 """
 
 
-def select_item(item_id: uuid.UUID) -> list[dict[str, Any]]:
-    """1件の行を読む。見つかれば1行、無ければ空の一覧（→ 指揮役が 404）。"""
-    return select_rows(SELECT_ITEM_SQL, [{"name": "id", "value": {"stringValue": str(item_id)}}])
+def select_item(item_id: uuid.UUID) -> dict[str, Any] | None:
+    """1件の行を読む。無ければ None（→ 指揮役が 404）。詳細と確定で使う。
+
+    None は「調べた結果、無い」だけを意味する（DB が起きないときは DatabaseResumingError が飛ぶ）。
+    """
+    rows = select_rows(SELECT_ITEM_SQL, [{"name": "id", "value": {"stringValue": str(item_id)}}])
+    return rows[0] if rows else None
 
 
-def parse_ai_result(raw: str | None) -> dict[str, Any] | None:
-    """ai_result（jsonb）を辞書にする。Data API は jsonb を JSON の文字列のまま返すため。解析前は None。"""
-    if raw is None:
-        return None
-    ai_result: dict[str, Any] = json.loads(raw)
-    return ai_result
+def to_item_detail(row: dict[str, Any]) -> ItemDetail:
+    """DB の行を、詳細の返り値（ItemDetail）にする。詳細と確定の両方で使う共通の処理。
+
+    jsonb の列（ai_result・features）は Data API から JSON の文字列で届くので、辞書・一覧に戻す。
+    写真を見るための署名付きURLもここで付ける。ItemDetail に無い列（s3_key）は Pydantic が捨てる。
+    """
+    return ItemDetail.model_validate(
+        {
+            **row,
+            "ai_result": parse_jsonb(row["ai_result"]),
+            "features": parse_jsonb(row["features"]),
+            "photo_url": make_photo_url(row["s3_key"]),
+        }
+    )
+
+
+def parse_jsonb(raw: str | None) -> Any:
+    """jsonb の列を Python の値（辞書・一覧）にする。Data API は jsonb を JSON の文字列のまま返すため。NULL は None。"""
+    return json.loads(raw) if raw is not None else None
 
 
 def make_photo_url(s3_key: str) -> str:
@@ -332,3 +331,97 @@ def make_photo_url(s3_key: str) -> str:
         ExpiresIn=PHOTO_URL_EXPIRES_SECONDS,
     )
     return url
+
+
+# ===========================================================================
+# 確定：POST /items/{item_id}/confirm（admin だけ）
+# ===========================================================================
+
+# 確定できる状態。pending_review（AI の答えを人が直す）と、analysis_failed（AI が失敗した写真に人が手で入力する）
+CONFIRMABLE_STATUSES = ("pending_review", "analysis_failed")
+
+
+class Confirmation(BaseModel):
+    """確定のときに受け取るもの（admin が確かめた値）。AI の答え（ai_result）には触らない。"""
+
+    category: str = Field(min_length=1)  # 種別は必須。空の文字列も 422
+    color: str | None = None
+    brand: str | None = None
+    features: list[str] | None = None  # ["二つ折り", "革製"]。AI の features と同じ形
+
+
+# --- 指揮役 ---
+
+
+@router.post("/items/{item_id}/confirm")
+def confirm_item(
+    item_id: uuid.UUID,
+    confirmation: Confirmation,
+    user: Annotated[User, Depends(require_admin)],  # admin でなければ 403（auth.py）
+) -> ItemDetail:
+    """admin が内容を確定する。status を confirmed にし、人の値・確定した人・保管期限を入れる。"""
+    row = select_item(item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="その拾得物は見つかりません")
+    if not is_confirmable(row["status"]):
+        raise HTTPException(
+            status_code=409, detail=f"状態が {row['status']} の拾得物は確定できません"
+        )
+
+    updated = update_confirmed(item_id, user.sub, confirmation)  # 書き込む
+    if not updated:
+        # 上で確かめてから書き込むまでの間に、ほかの人が先に確定した（admin が2人同時に押した、など）
+        raise HTTPException(
+            status_code=409, detail="ほかの人が先に状態を変えました。読み直してください"
+        )
+    return get_item(item_id)  # 確定した後の行を、詳細と同じ形で返す（画面はこれで表示を更新できる）
+
+
+# --- 部品 ---
+
+
+def is_confirmable(status: str) -> bool:
+    """確定できる状態なら True。"""
+    return status in CONFIRMABLE_STATUSES
+
+
+# retention_deadline（保管期限）：拾得日 + 3か月。拾得日は日本時間で数える
+#   （UTC のままだと、日本時間の朝9時より前に拾った物の日付が前日になる）。
+# WHERE の status の条件：確かめてから書き込むまでの間に状態が変わっていたら、1行も書き換えない。
+#   読んで・確かめて・書く、の隙間で起きる取り合いを、DB の側で止める書き方。
+CONFIRMABLE_SQL_LIST = ", ".join(f"'{status}'" for status in CONFIRMABLE_STATUSES)
+UPDATE_CONFIRMED_SQL = f"""
+UPDATE items SET
+  status             = 'confirmed',
+  category           = :category,
+  color              = :color,
+  brand              = :brand,
+  features           = CAST(:features AS JSONB),
+  confirmed_by       = :confirmed_by,
+  confirmed_at       = now(),
+  retention_deadline = CAST(CAST(registered_at AT TIME ZONE 'Asia/Tokyo' AS DATE) + INTERVAL '3 months' AS DATE),
+  updated_at         = now()
+WHERE id = CAST(:id AS UUID)
+  AND status IN ({CONFIRMABLE_SQL_LIST})
+"""
+
+
+def update_confirmed(item_id: uuid.UUID, confirmed_by: str, confirmation: Confirmation) -> bool:
+    """確定の内容を書き込む。書き換えられたら True、状態が変わっていて1行も書き換えなかったら False。"""
+    features = (
+        json.dumps(confirmation.features, ensure_ascii=False)
+        if confirmation.features is not None
+        else None
+    )
+    response = execute_sql(
+        UPDATE_CONFIRMED_SQL,
+        [
+            {"name": "id", "value": {"stringValue": str(item_id)}},
+            {"name": "category", "value": {"stringValue": confirmation.category}},
+            {"name": "color", "value": text_or_null(confirmation.color)},
+            {"name": "brand", "value": text_or_null(confirmation.brand)},
+            {"name": "features", "value": text_or_null(features)},
+            {"name": "confirmed_by", "value": {"stringValue": confirmed_by}},
+        ],
+    )
+    return response["numberOfRecordsUpdated"] == 1

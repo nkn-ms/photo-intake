@@ -1,4 +1,7 @@
-"""認証：リクエストしてきた人を、JWT の中身から作る。
+"""認証と認可。
+
+  認証（get_current_user）… リクエストしてきたのは誰か。分からなければ 401
+  認可（require_admin）  … その人に、その操作をする権限があるか。無ければ 403
 
 ■ 認証は API Gateway がやり、このアプリは結果を読むだけ
   JWT が本物か・期限内かは、API Gateway の JWT オーソライザーが Lambda を呼ぶ前に確かめる。
@@ -12,9 +15,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 
 
@@ -81,3 +84,35 @@ def parse_groups(raw: str) -> list[str]:
     角かっこを外して、空白で区切る。グループに入っていなければ "" で、空の一覧になる。
     """
     return raw.strip("[]").split()
+
+
+# ===========================================================================
+# 認可：admin だけができる操作
+# ===========================================================================
+
+ADMIN_GROUP = "admin"  # Cognito のグループ名（main.tf の aws_cognito_user_group.admin）
+
+
+# --- 指揮役 ---
+
+
+def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
+    """admin だけを通す。admin 専用のルートで user: Annotated[User, Depends(require_admin)] と書く。
+
+    admin 専用のルートはこれから増える（確定・警察への届出・返還など）ので、確認を1か所にまとめ、
+    ルートには1行で書けるようにする（書き忘れると誰でもできてしまうので、短く書けることが大事）。
+
+    これ自体も Depends(get_current_user) を使うので、FastAPI は get_current_user（401 の確認）を先に呼ぶ。
+    ここに来た時点で「誰か」は分かっていて、確かめるのは「admin か」だけ。
+    """
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="admin だけができる操作です")
+    return user
+
+
+# --- 部品 ---
+
+
+def is_admin(user: User) -> bool:
+    """admin のグループに入っていれば True。"""
+    return ADMIN_GROUP in user.groups

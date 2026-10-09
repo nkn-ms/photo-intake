@@ -2,6 +2,7 @@
 
   execute_sql … SQL を1本送る。DB の起動待ちをする。INSERT・UPDATE はこれを使う
   select_rows … SELECT を送り、結果を「列名 → 値」の辞書の一覧で返す。中で execute_sql を使う
+  text_or_null … SQL に渡す文字列の値を作る。None なら NULL
 
 ■ DB が起きなかったときは、例外 DatabaseResumingError を投げる（None は返さない）
   ルートでは何も書かなくてよい。app.py の例外ハンドラーが受け取って 503 にする。
@@ -22,6 +23,7 @@ import boto3
 if TYPE_CHECKING:
     from types_boto3_rds_data.type_defs import (
         ExecuteStatementResponseTypeDef,
+        FieldTypeDef,
         SqlParameterTypeDef,
     )
 
@@ -86,3 +88,11 @@ def select_rows(sql: str, parameters: list[SqlParameterTypeDef]) -> list[dict[st
     response = execute_sql(sql, parameters, as_json=True)
     rows: list[dict[str, Any]] = json.loads(response.get("formattedRecords", "[]"))
     return rows
+
+
+def text_or_null(value: str | None) -> FieldTypeDef:
+    """SQL に渡す文字列の値を作る。None なら NULL を渡す。
+
+    Data API では NULL を {"isNull": True} と書く決まり。任意の項目（拾得場所・色など）で毎回使うので、1つにまとめる。
+    """
+    return {"stringValue": value} if value is not None else {"isNull": True}

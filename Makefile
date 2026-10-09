@@ -99,10 +99,10 @@ resend:           ## S3 の通知と同じ形のメッセージを手で送る
 .PHONY: sql
 
 # Data API で SQL を1本送る。
-#   make sql SQL="select version()"
+#   make sql SQL="SELECT version()"
 # ARN は terraform output（ローカルの state）から取るので、ここでは AWS に触らない。
 # 一時停止中だと DatabaseResumingException が返るので、十数秒おいて打ち直す。
-SQL ?= select 1
+SQL ?= SELECT 1
 sql:              ## Data API で SQL を1本送る
 	aws rds-data execute-statement \
 	  --resource-arn "$$($(TF) output -raw db_cluster_arn)" \
@@ -132,14 +132,18 @@ stmt-run:         ## マイグレーションの N 番目の文を Data API で�
 	  --database photo_intake \
 	  --sql "$$($(STMT))"
 
-# マイグレーションの文を 1 番から順にすべて流す。空の DB に1回だけ流す前提。
+# マイグレーションのファイルを番号順に、それぞれの文を 1 番から順にすべて流す。
+#   make migrate                                                   … 全部（destroy → apply した後の空の DB 用）
+#   make migrate MIGRATIONS=backend/migrations/002_features_jsonb.sql … 指定したファイルだけ（今ある DB に足す用）
+# 流し済みのファイルを覚える仕組みは無い。今ある DB に全部を流すと、001 の CREATE TABLE が
+# 「もうある」で失敗して止まる（壊れはしない）。今ある DB には、新しいファイルだけを指定する。
 #
 # ① まず DB を起こす。一時停止中は DatabaseResumingException が返るので、
-#    select 1 が通るまで10秒おきに打ち直す（一度起きれば5分は止まらない）。
+#    SELECT 1 が通るまで10秒おきに打ち直す（一度起きれば5分は止まらない）。
 #    上限は12回（約2分）。ログイン切れや apply 忘れだと何回打っても通らないので、
 #    上限なしだと何も表示されないまま永遠に待つことになる。
 #    待っている間の出力は捨てる（>/dev/null 2>&1）。12回目に失敗したときだけ、
-#    捨てずにもう一度 select 1 を送って、本当の理由を画面に出す。
+#    捨てずにもう一度 SELECT 1 を送って、本当の理由を画面に出す。
 # ② 起きてから文を順に流す。どれか1つでも失敗したらそこで止まる。
 #    ここは打ち直さない。SQL の書き間違いだと永遠に終わらなくなるため。
 #
@@ -147,19 +151,23 @@ stmt-run:         ## マイグレーションの N 番目の文を Data API で�
 #   dev なら make destroy → make apply で作り直せばよい。
 # 文の数は awk で数える（NF は「空白以外の中身があるかたまり」だけを数えるため）。
 .PHONY: migrate
+# $(wildcard …) は一致するファイルの一覧、$(sort …) はそれを名前順に並べる（001 → 002 → …）
+MIGRATIONS ?= $(sort $(wildcard backend/migrations/*.sql))
 migrate:          ## マイグレーションの文をすべて順に流す
 	@echo "--- DB を起こす（止まっていたら起きるまで待つ）"
 	@for i in $$(seq 1 12); do \
-	  $(MAKE) -s sql SQL="select 1" >/dev/null 2>&1 && break; \
+	  $(MAKE) -s sql SQL="SELECT 1" >/dev/null 2>&1 && break; \
 	  [ $$i -eq 12 ] && { echo "DB に繋がらない。最後のエラー："; $(MAKE) -s sql; exit 1; }; \
 	  echo "  起動を待っています… ($$i/12)"; sleep 10; \
 	done
-	@total=$$(awk -v RS=';' 'NF{c++} END{print c}' $(MIGRATION)); \
-	for n in $$(seq 1 $$total); do \
-	  echo "--- 文 $$n/$$total"; \
-	  $(MAKE) -s stmt-run N=$$n || exit 1; \
+	@for f in $(MIGRATIONS); do \
+	  total=$$(awk -v RS=';' 'NF{c++} END{print c}' $$f); \
+	  for n in $$(seq 1 $$total); do \
+	    echo "--- $$f 文 $$n/$$total"; \
+	    $(MAKE) -s stmt-run N=$$n MIGRATION=$$f || exit 1; \
+	  done; \
 	done; \
-	echo "--- 完了：$(MIGRATION) の文 $$total 個をすべて流した"
+	echo "--- 完了：$(MIGRATIONS)"
 
 # --- Cognito ---
 .PHONY: user token password
@@ -266,6 +274,16 @@ call:             ## API Gateway の URL に curl でリクエストを出す
 	  curl -s -i -H "Authorization: Bearer $$(cat .build/$(TOKEN)_token)" "$(API_URL)$(patsubst /%,%,$(ROUTE))"; \
 	fi; echo
 
+# 拾得物を確定する（8d-2）。admin だけができる。人が確かめた値は決め打ち（財布・黒・二つ折り・革製）。
+#   make confirm ID=<items の id>
+# トークンは make token で最後にログインした人のもの。staff なら 403、admin なら 200 になるのが正しい。
+.PHONY: confirm
+confirm:          ## 拾得物を確定する（admin だけ）
+	@test -n "$(ID)" || { echo "ID= に items の id を指定してください（make call ROUTE=/items で見られる）"; exit 1; }
+	@curl -s -i -X POST -H "Authorization: Bearer $$(cat .build/access_token)" -H "Content-Type: application/json" \
+	  -d '{"category": "財布", "color": "黒", "features": ["二つ折り", "革製"]}' \
+	  "$(API_URL)items/$(ID)/confirm"; echo
+
 # 写真を登録する（8c）。画面がやることを、curl で順にやる。
 #   make register FILE=wallet.jpg
 # ① POST /items（アクセストークンを付けて）→ API が items に行を作り、署名付きURLを返す
@@ -292,5 +310,5 @@ items:            ## 最近登録した items を5件表示する
 	  --resource-arn "$$($(TF) output -raw db_cluster_arn)" \
 	  --secret-arn "$$($(TF) output -raw db_secret_arn)" \
 	  --database photo_intake --format-records-as JSON \
-	  --sql "select id, status, s3_key, registered_by, ai_model, created_at from items order by created_at desc limit 5" \
+	  --sql "SELECT id, status, s3_key, registered_by, ai_model, created_at FROM items ORDER BY created_at DESC LIMIT 5" \
 	  --query formattedRecords --output text | python3 -m json.tool --no-ensure-ascii
