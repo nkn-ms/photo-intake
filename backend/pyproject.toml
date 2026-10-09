@@ -36,9 +36,9 @@ dev = [
 default-groups = ["dev", "api"]
 
 [tool.pytest.ini_options]
-# テストから import handler で worker/handler.py を読めるようにする。
-# Lambda でも zip の一番上に handler.py が置かれ、import handler として読まれるので、それに合わせている。
-pythonpath = ["worker"]
+# テストから import handler で worker/handler.py を、import app で api/app.py を読めるようにする。
+# Lambda でも zip の一番上に handler.py（app.py）が置かれ、import handler（import app）として読まれるので、それに合わせている。
+pythonpath = ["worker", "api"]
 testpaths = ["tests"]
 
 [tool.mypy]

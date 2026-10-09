@@ -1,5 +1,8 @@
 """全部のテストに共通の準備。pytest がテストより先に自動で読み込む（Jest の setupFiles に当たる）。
 
+API のテスト（test_api.py）は moto を使わない（Data API を自前の偽物に差し替えるため）。
+以下の順番の話は worker（handler.py）のテストのもの。
+
 handler.py は import された瞬間に、環境変数を読み、boto3 のクライアントを作る。
 だから次の順番を守る:
   1. 環境変数を用意する（このファイルの一番上。テストが1つも動く前）
@@ -30,6 +33,7 @@ os.environ["IDEMPOTENCY_TABLE"] = "test-idempotency"
 os.environ["DB_CLUSTER_ARN"] = "arn:aws:rds:ap-northeast-1:123456789012:cluster:test"
 os.environ["DB_SECRET_ARN"] = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:test"
 os.environ["DB_NAME"] = "photo_intake"
+os.environ["UPLOAD_BUCKET"] = BUCKET  # API が署名付きURLを作るバケット
 os.environ["VISION_MODEL_ID"] = "jp.amazon.nova-2-lite-v1:0"
 os.environ["MAX_RECEIVE_COUNT"] = "3"
 # Bedrock は moto で偽物にできないので、本物を呼ばない側にしておく。答えはテストごとに差し替える
