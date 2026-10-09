@@ -1,0 +1,11 @@
+/* 画面全体の最低限の見た目。スマホ（登録）と PC（確定）の両方で読めればよい */
+:root {
+  font-family: system-ui, sans-serif;
+  line-height: 1.6;
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+}
