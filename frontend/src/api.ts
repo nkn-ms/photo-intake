@@ -33,6 +33,49 @@ export function getMe(): Promise<Me> {
   return request<Me>('GET', '/me')
 }
 
+/** POST /items に送るもの（API の routers/items.py の NewItem と同じ形） */
+export interface NewItem {
+  content_type: 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif'
+  location?: string | null // 拾得場所（任意）
+  registered_at?: string | null // 拾得日時（任意。省略したら API が今の時刻にする）
+}
+
+/** POST /items の返り値（API の CreatedItem と同じ形） */
+export interface CreatedItem {
+  item_id: string
+  upload_url: string // 写真を PUT する先（署名付きURL）
+  upload_headers: Record<string, string> // PUT のときに付けるヘッダー（署名に含まれている）
+  expires_in: number // upload_url が使える残り秒数
+}
+
+/** 拾得物を登録する。API が行を作り（analyzing）、写真を置くための署名付きURLを返す。 */
+export function createItem(newItem: NewItem): Promise<CreatedItem> {
+  return request<CreatedItem>('POST', '/items', newItem)
+}
+
+// ===========================================================================
+// S3（署名付きURL）
+// ===========================================================================
+
+/**
+ * 署名付きURLに写真を PUT する。API は通らず、S3 に直接送る（make register の②と同じ）。
+ *
+ * アクセストークンは付けない。S3 は JWT を知らず、URL の署名だけで確かめるため。
+ * ヘッダーは API が返した upload_headers をそのまま付ける（Content-Type が署名と違うと S3 が 403 で拒否する）。
+ * 届いた後は S3 → SQS → worker が動き、行が analyzing → pending_review に進む。
+ */
+export async function uploadPhoto(created: CreatedItem, photo: Blob): Promise<void> {
+  const response = await fetch(created.upload_url, {
+    method: 'PUT',
+    headers: created.upload_headers,
+    body: photo,
+  })
+  if (!response.ok) {
+    // S3 のエラーの本文は XML なので読まない。403 なら URL の期限切れ（5分）か Content-Type の違い
+    throw new ApiError(response.status, `写真を送れませんでした（S3：${response.status}）`, null)
+  }
+}
+
 // ===========================================================================
 // 共通の処理
 // ===========================================================================

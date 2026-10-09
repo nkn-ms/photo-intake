@@ -47,6 +47,25 @@ resource "aws_s3_bucket_public_access_block" "uploads" {
   restrict_public_buckets = true
 }
 
+# CORS：画面（ブラウザ）から、署名付きURLへ写真を PUT してよいかの許可（9c）。
+#
+# 画面のオリジン（localhost:5173 など）と、S3 のオリジン（bucket.s3.ap-northeast-1.amazonaws.com）は別。
+# ブラウザは PUT の前に preflight request を送り、S3 がここの設定で答える。curl は確かめないので、8c では要らなかった。
+#
+# これは「公開する」設定ではない。許すのは「この画面のブラウザが、ここに呼び出しを送ること」だけで、
+# 中身を読み書きできるかは、これまでどおり署名（署名付きURL）と権限で決まる。上のパブリックアクセスのブロックもそのまま。
+# 写真を見る GET（詳細の photo_url）は <img src> で読むだけなので、CORS は要らない（JS で中身を読むときだけ要る）。
+resource "aws_s3_bucket_cors_configuration" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+
+  cors_rule {
+    allowed_origins = local.web_origins # API Gateway の CORS と同じ一覧（API を呼ぶ画面 ＝ 写真を置く画面）
+    allowed_methods = ["PUT"]
+    allowed_headers = ["content-type"] # 署名付きURLに含めた Content-Type を付けて送るため
+    max_age_seconds = 300
+  }
+}
+
 # 画像の解析を後ろで回すためのキュー。
 #
 # 解析には数秒かかる。同期処理だとアップロードの応答がその分待たされるので、

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-// 一番外側の部品。ログインしていなければフォーム、していれば /me の結果を出す（9b）。
-// 登録・一覧などの画面は 9c 以降でここに足す
+// 一番外側の部品。ログインしていなければフォーム、していれば登録の画面を出す。
+// 一覧・詳細の画面は 9d でここに足す
 import { onMounted, ref } from 'vue'
 import { ApiError, getMe, type Me } from './api'
 import { getAccessToken, logOut } from './auth'
 import LoginForm from './components/LoginForm.vue'
+import RegisterForm from './components/RegisterForm.vue'
 
 const me = ref<Me | null>(null) // ログインしている人。null ならログインしていない
 const loading = ref(true)
@@ -44,6 +45,7 @@ async function onLogOut(): Promise<void> {
   <section v-else>
     <p>ログイン中：{{ me.sub }}（{{ me.groups.join('・') }}）</p>
     <button @click="onLogOut">ログアウト</button>
+    <RegisterForm />
   </section>
   <p v-if="error" class="error">{{ error }}</p>
 </template>
