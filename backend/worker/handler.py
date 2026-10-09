@@ -374,14 +374,14 @@ def execute_sql(sql: str, parameters: list[SqlParameterTypeDef]) -> ExecuteState
 #
 # :名前 はパラメータ。値は SQL の文字列に埋め込まず、parameters で別に渡す（SQL インジェクション対策）。
 UPDATE_SQL = """
-update items
-   set status         = 'pending_review',
+UPDATE items
+   SET status         = 'pending_review',
        ai_result      = :ai_result,
        ai_model       = :ai_model,
        ai_analyzed_at = now(),
        updated_at     = now()
- where s3_key = :s3_key
-   and status = 'analyzing'
+ WHERE s3_key = :s3_key
+   AND status = 'analyzing'
 """
 
 
@@ -410,13 +410,13 @@ def save_result(key: str, ai_result: dict[str, Any]) -> None:
 # 条件は UPDATE_SQL と同じ（status = 'analyzing' のときだけ）。
 # ai_model も残すのは、「どのモデルが JSON を返し損ねたか」を後で数えられるようにするため。
 FAIL_SQL = """
-update items
-   set status     = 'analysis_failed',
+UPDATE items
+   SET status     = 'analysis_failed',
        ai_error   = :ai_error,
        ai_model   = :ai_model,
        updated_at = now()
- where s3_key = :s3_key
-   and status = 'analyzing'
+ WHERE s3_key = :s3_key
+   AND status = 'analyzing'
 """
 
 
