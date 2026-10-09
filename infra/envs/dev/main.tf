@@ -920,8 +920,24 @@ resource "aws_apigatewayv2_api" "main" {
   name          = "photo-intake-dev"
   protocol_type = "HTTP" # HTTP API（新しく安いほう）。REST API ではない
 
-  # CORS（別のドメインの画面からの呼び出しを許す設定）は、画面を作るステップ9で足す。
-  # 今は curl から呼ぶだけなので要らない。
+  # CORS：別のオリジン（画面を配った場所）のブラウザから、この API を呼んでよいかの許可（9b）。
+  # ブラウザは Authorization ヘッダー付きの呼び出しの前に、OPTIONS のリクエストで許可を確かめる（preflight request）。
+  # ここを書くと、API Gateway がその preflight request に自分で答える（Lambda は呼ばれない）。
+  # curl は preflight request を送らないので、今まではこの設定が無くても呼べていた。
+  cors_configuration {
+    allow_origins = local.web_origins
+    allow_methods = ["GET", "POST"]
+    allow_headers = ["authorization", "content-type"]
+    # 503 の Retry-After を画面の JS から読めるようにする（既定では読めるヘッダーが限られている）
+    expose_headers = ["retry-after"]
+    max_age        = 300 # preflight request の結果をブラウザが覚えておく秒数（毎回送らなくて済む）
+  }
+}
+
+locals {
+  # API を呼んでよい画面のオリジン。今はローカルの開発サーバー（npm run dev）だけ。
+  # CloudFront で公開したら（9e）、その URL を足す。
+  web_origins = ["http://localhost:5173"]
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -966,11 +982,17 @@ resource "aws_apigatewayv2_integration" "api" {
   payload_format_version = "2.0"
 }
 
-# ルートは2本だけにする:
-#   GET /health      … 認証なし（生きているかの確認用）
-#   ANY /{proxy+}    … それ以外すべて。JWT 必須
+# ルート:
+#   GET /health                   … 認証なし（生きているかの確認用）
+#   GET /{proxy+}・POST /{proxy+} … それ以外すべて。JWT 必須
 # 「既定で認証必須、例外だけを開ける」形。FastAPI にルートを足しても、ここを書き換える必要がなく、
 # 書き忘れて認証なしで公開してしまうこともない。どのパスがあるかは FastAPI（app.py）が決める。
+#
+# 8b では ANY /{proxy+}（どのメソッドでも）だった。9b で GET と POST の2本に分けた理由:
+#   ANY だと、ブラウザの preflight request（OPTIONS）もこのルートに当たり、JWT を求めて 401 で弾きうる
+#   （preflight request には Authorization ヘッダーが付かない。公式ドキュメントは「どのメソッドでも当たる」$default ルートについて
+#   同じ注意を書いている）。OPTIONS に当たるルートを無くしておけば、API Gateway が CORS の設定を使って自分で preflight request に答える。
+#   使っているメソッドだけを開ける、という意味でも狭いほうがよい（PUT・DELETE を足すときはここにも足す）。
 resource "aws_apigatewayv2_route" "health" {
   api_id    = aws_apigatewayv2_api.main.id
   route_key = "GET /health"
@@ -979,8 +1001,10 @@ resource "aws_apigatewayv2_route" "health" {
 }
 
 resource "aws_apigatewayv2_route" "authenticated" {
+  for_each = toset(["GET", "POST"]) # 同じ形のルートを、メソッドごとに1本ずつ作る
+
   api_id    = aws_apigatewayv2_api.main.id
-  route_key = "ANY /{proxy+}" # {proxy+} は「どんなパスでも」。ANY は「どのメソッドでも」
+  route_key = "${each.key} /{proxy+}" # {proxy+} は「どんなパスでも」
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
 
   authorization_type = "JWT"

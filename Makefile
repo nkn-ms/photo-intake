@@ -312,3 +312,22 @@ items:            ## 最近登録した items を5件表示する
 	  --database photo_intake --format-records-as JSON \
 	  --sql "SELECT id, status, s3_key, registered_by, ai_model, created_at FROM items ORDER BY created_at DESC LIMIT 5" \
 	  --query formattedRecords --output text | python3 -m json.tool --no-ensure-ascii
+
+# --- フロント（ステップ9）---
+.PHONY: web-env
+
+# 画面が使う値を、Terraform の出力から frontend/.env.local に書き出す（AWS には触らない。ローカルの state を読むだけ）。
+# destroy → apply のたびに User Pool の ID・API の URL が変わるので、apply の後に打ち直す。
+#
+# Vite は VITE_ で始まる変数だけを、画面のコード（import.meta.env.VITE_〜）に渡す（Next.js の NEXT_PUBLIC_ と同じ）。
+# ここに入れる値は秘密ではない。build すると JS の中に埋め込まれ、誰でも読める
+#（User Pool の ID とアプリクライアントの ID は、ログインの画面に必ず要る公開の値）。
+# .env.local は gitignore 済み（ルートの .env.* と、frontend の *.local）。
+WEB_ENV = frontend/.env.local
+web-env:          ## 画面が使う値（User Pool・クライアント・API の URL）を frontend/.env.local に書き出す
+	@{ \
+	  echo "VITE_COGNITO_USER_POOL_ID=$$($(TF) output -raw cognito_user_pool_id)"; \
+	  echo "VITE_COGNITO_CLIENT_ID=$$($(TF) output -raw cognito_client_id)"; \
+	  echo "VITE_API_URL=$(API_URL)"; \
+	} > $(WEB_ENV)
+	@echo "書き出した: $(WEB_ENV)"; cat $(WEB_ENV)
