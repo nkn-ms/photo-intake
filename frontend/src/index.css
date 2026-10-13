@@ -1,0 +1,99 @@
+/* 画面全体の最低限の見た目。スマホ（登録）と PC（確定）の両方で読めればよい */
+:root {
+  font-family: system-ui, sans-serif;
+  line-height: 1.6;
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+}
+
+form {
+  display: grid;
+  gap: 12px;
+  max-width: 320px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+}
+
+.error {
+  color: #d33;
+}
+
+/* 上部のメニュー（Vue 版では App.vue の scoped CSS に書いていた） */
+nav {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+/* 登録の画面で、送る写真を見せる（Vue 版では RegisterForm.vue の scoped CSS に書いていた） */
+.preview {
+  max-width: 100%;
+  max-height: 240px;
+  object-fit: contain;
+}
+
+/* 一覧と詳細の表（Vue 版では各ページの scoped CSS に同じものを書いていた） */
+.toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+table {
+  border-collapse: collapse;
+}
+th,
+td {
+  border-bottom: 1px solid #ddd;
+  padding: 6px 12px;
+  text-align: left;
+}
+/* 一覧で、30分以上 analyzing のままの行に付ける印 */
+.stale {
+  display: block;
+  color: #b00;
+  font-size: 0.85em;
+}
+
+/* 詳細の画面：写真と、状態などの欄を横に並べる（狭い画面では折り返す） */
+.detail-layout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  align-items: flex-start;
+}
+.photo {
+  max-width: 320px;
+  height: auto;
+}
+.no-photo {
+  width: 320px;
+  color: #666;
+}
+dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 16px;
+  margin: 0;
+}
+dt {
+  color: #666;
+}
+dd {
+  margin: 0;
+}
+/* AI の答えと確定した値が違う行 */
+.differs td {
+  background: #fff4d6;
+}
+.note {
+  color: #666;
+  font-size: 0.85em;
+}

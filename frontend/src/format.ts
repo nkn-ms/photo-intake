@@ -1,7 +1,7 @@
 /**
- * API から届いた値を、画面に出す文字に直す処理。一覧と詳細の両方で使う。
+ * API から届いた値や例外を、画面に出す文字に直す処理。いくつもの画面の部品で使う。
  */
-import type { ItemStatus } from './api'
+import { ApiError, type ItemStatus } from './api'
 
 // 画面に出す状態の名前。Record<ItemStatus, string> なので、状態が増えたのにここを足し忘れると型チェックで止まる
 export const STATUS_LABELS: Record<ItemStatus, string> = {
@@ -21,4 +21,10 @@ export function formatDateTime(iso: string): string {
     dateStyle: 'short',
     timeStyle: 'short',
   })
+}
+
+// 捕まえた例外を、画面に出す文にする。API のエラーは「409：ほかの人が先に…」のように番号を付ける。
+// Vue 版では各部品に同じ1行を書いていたが、React 版では共通にした
+export function toErrorMessage(e: unknown): string {
+  return e instanceof ApiError ? `${e.status}：${e.message}` : String(e)
 }
