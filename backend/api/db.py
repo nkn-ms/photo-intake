@@ -45,7 +45,7 @@ DB_RESUME_MAX_ATTEMPTS = 5
 
 
 class DatabaseResumingError(Exception):
-    """DB が一時停止から起きなかった。
+    """DB（Aurora）が一時停止から起きなかったことを表す例外。execute_sql が投げる。
 
     どこで投げられても、app.py の例外ハンドラー（db_resuming）が受け取って 503 と Retry-After を返す。
     """

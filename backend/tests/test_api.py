@@ -139,12 +139,12 @@ def data_api(monkeypatch: pytest.MonkeyPatch) -> FakeDataApi:
 
 
 def rows(*records: dict) -> dict:
-    """SELECT の答え（formatRecordsAs="JSON" の形）。"""
+    """偽の Data API に返させる、SELECT の答えを作る（formatRecordsAs="JSON" のときの形）。"""
     return {"formattedRecords": json.dumps(list(records))}
 
 
 def updated(count: int) -> dict:
-    """UPDATE の答え（書き換えた行の数）。"""
+    """偽の Data API に返させる、UPDATE の答えを作る（書き換えた行の数だけが入っている）。"""
     return {"numberOfRecordsUpdated": count}
 
 

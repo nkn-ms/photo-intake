@@ -85,7 +85,7 @@ resource "aws_sqs_queue" "ingest_dlq" {
   message_retention_seconds = 1209600
 }
 
-# 何回渡しても処理できなかったら DLQ に移すか。
+# SQS が同じメッセージを worker に渡す回数の上限。この回数だけ渡しても処理できなければ、DLQ に移す。
 #
 # この数は2か所で使う：本体キューの maxReceiveCount と、worker の環境変数 MAX_RECEIVE_COUNT。
 # worker は「この回数目の配信が最終試行」と判断して analysis_failed を書くので、
@@ -389,7 +389,7 @@ resource "aws_iam_role_policy" "worker_bedrock" {
         ["arn:aws:bedrock:ap-northeast-1:${data.aws_caller_identity.current.account_id}:inference-profile/jp.${var.vision_model_id}"],
         # ② 送信先のモデル本体（リージョンの数だけ作る）
         [for r in local.bedrock_regions : "arn:aws:bedrock:${r}::foundation-model/${var.vision_model_id}"],
-        # 埋め込み
+        # ③ 埋め込みのモデル（文章を数字の並びに変える。ステップ10の類似検索で使う）。推論プロファイルを通さずに呼ぶ
         ["arn:aws:bedrock:ap-northeast-1::foundation-model/${local.embed_model_id}"],
       )
     }]
@@ -760,7 +760,7 @@ resource "aws_cognito_user_pool_client" "web" {
   # ブラウザで動く画面に秘密を入れても、開発者ツールで誰でも見られるので意味がない。
   generate_secret = false
 
-  # 受け付けるログインの方式
+  # このアプリクライアントで受け付けるログインの方式（下の3つ）
   explicit_auth_flows = [
     # SRP：パスワードそのものを送らずに、「知っている」ことだけを証明する方式。画面ではこちらを使う
     "ALLOW_USER_SRP_AUTH",
@@ -1001,8 +1001,8 @@ resource "aws_apigatewayv2_integration" "api" {
   payload_format_version = "2.0"
 }
 
-# ルート:
-#   GET /health                   … 認証なし（生きているかの確認用）
+# ルート（どのメソッド・パスのリクエストを受け付け、認証を求めるか）:
+#   GET /health                   … 認証なし（API が動いているかの確認用）
 #   GET /{proxy+}・POST /{proxy+} … それ以外すべて。JWT 必須
 # 「既定で認証必須、例外だけを開ける」形。FastAPI にルートを足しても、ここを書き換える必要がなく、
 # 書き忘れて認証なしで公開してしまうこともない。どのパスがあるかは FastAPI（app.py）が決める。

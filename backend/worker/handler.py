@@ -58,13 +58,13 @@ rds_data = boto3.client("rds-data")  # Data API（HTTPS で SQL を送る）
 idempotency_store = DynamoDBPersistenceLayer(table_name=os.environ["IDEMPOTENCY_TABLE"])
 
 idempotency_config = IdempotencyConfig(
-    # 何で「同じ通知」を見分けるか。analyze_and_record に渡す photo のうち key（S3 のキー）だけを使う。
+    # 「同じ通知」を見分けるのに使う値。analyze_and_record に渡す photo のうち、key（S3 のキー）だけを使う。
     # API が登録ごとに新しいキーを発行するので、1つのキー ＝ 1回の登録。
     # "key" は JMESPath（AWS CLI の --query と同じ書き方）で「photo の中の key」という意味。
     event_key_jmespath="key",
     # key が取り出せなかったら、冪等性を効かせずに素通りするのではなく、エラーにする
     raise_on_no_idempotency_key=True,
-    # 「済み」の記録を何秒残すか（Powertools の既定と同じ。分かるように明示した）。過ぎたら TTL が消す。
+    # 「済み」の記録を残しておく秒数（Powertools の既定と同じ値だが、分かるように明示した）。過ぎたら TTL が消す。
     # SQS の重複配信はたいてい数分以内、やり直しも 6分 × 3回 で終わるので、1時間あれば足りる。
     # 1時間を過ぎて重複が来ても、Aurora の UPDATE（status = 'analyzing' の条件）が上書きを止める。
     expires_after_seconds=3600,
@@ -215,9 +215,10 @@ class Upload:
     frozen=True で、作った後に値を書き換えられないようにしている。
     """
 
-    bucket: str
-    key: str
-    receive_count: int  # 何回目の配信か（最終試行の判断に使う）
+    bucket: str  # 写真が置かれたバケットの名前
+    key: str  # 写真の S3 のキー（uploads/….jpg）
+    # SQS がこのメッセージを渡した回数（1回目なら 1）。最終試行かどうかの判断に使う
+    receive_count: int
 
 
 def parse_event(event: dict[str, Any]) -> list[Upload]:
@@ -240,7 +241,7 @@ def parse_event(event: dict[str, Any]) -> list[Upload]:
             logger.info("skipped non-s3 event: %s", body.get("Event", "unknown"))
             continue
 
-        # このメッセージが何回目の配信か。SQS は数字を文字列で入れてくる
+        # SQS がこのメッセージを渡した回数（1回目なら "1"）。SQS は数字を文字列で入れてくるので int にする
         receive_count = int(record["attributes"]["ApproximateReceiveCount"])
 
         for s3_event in body["Records"]:
@@ -282,10 +283,10 @@ def analyze_and_record(photo: dict[str, str]) -> dict[str, str]:
     """
     key = photo["key"]
     try:
-        image_format = check_format(key)  # 1. 対応している形式か
+        image_format = check_format(key)  # 1. 拡張子から、モデルに渡せる形式かを確かめる
         image_bytes = download(photo["bucket"], key)  # 2. S3 から写真を読む
-        answer = ask_model(image_bytes, image_format)  # 3. モデルに聞く
-        ai_result = parse_answer(answer)  # 4. 答えを JSON として読む
+        answer = ask_model(image_bytes, image_format)  # 3. 何が写っているかをモデルに答えてもらう
+        ai_result = parse_answer(answer)  # 4. モデルの答え（文字列）を JSON として読む
     except PermanentError as e:
         # 恒久的なエラー（1 か 4）。やり直しても同じなので、ここで処理を止める。
         # 失敗を DB に書いて正常に終わるので、SQS はメッセージを消す（やり直しは起きない）。
@@ -293,7 +294,7 @@ def analyze_and_record(photo: dict[str, str]) -> dict[str, str]:
         mark_failed(key, str(e))
         return {"key": key, "outcome": "analysis_failed"}
 
-    save_result(key, ai_result)  # 5. 保存して pending_review に進める
+    save_result(key, ai_result)  # 5. 答えを items に保存して、status を pending_review に進める
     return {"key": key, "outcome": "analyzed"}
 
 
@@ -333,8 +334,8 @@ def parse_answer(answer: str) -> dict[str, Any]:
 #
 # これは「待てば必ず直る」と分かっている一時的なエラーなので、SQS に6分預けてやり直すより、
 # その場で数秒待って送り直すほうが早い。最終試行の analysis_failed も書けるようになる。
-DB_RESUME_WAIT_SECONDS = 5  # 何秒おきに送り直すか
-DB_RESUME_MAX_ATTEMPTS = 6  # 何回まで送るか（待つのは最大 5秒 × 5回 = 25秒）
+DB_RESUME_WAIT_SECONDS = 5  # 送り直すまでに待つ秒数
+DB_RESUME_MAX_ATTEMPTS = 6  # SQL を送る回数の上限（1回目を含む。待つのは最大 5秒 × 5回 = 25秒）
 
 
 def execute_sql(sql: str, parameters: list[SqlParameterTypeDef]) -> ExecuteStatementResponseTypeDef:

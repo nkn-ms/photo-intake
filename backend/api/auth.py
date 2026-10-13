@@ -1,7 +1,7 @@
 """認証と認可。
 
-  認証（get_current_user）… リクエストしてきたのは誰か。分からなければ 401
-  認可（require_admin）  … その人に、その操作をする権限があるか。無ければ 403
+  認証（get_current_user）… リクエストしてきたのが誰かを確かめる。分からなければ 401（ログインしていない）
+  認可（require_admin）  … その人に、その操作をする権限があるかを確かめる。無ければ 403（権限が無い）
 
 ■ 認証は API Gateway がやり、このアプリは結果を読むだけ
   JWT が本物か・期限内かは、API Gateway の JWT オーソライザーが Lambda を呼ぶ前に確かめる。
@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 
 class User(BaseModel):
-    """リクエストしてきた人。JWT の中身から作る。"""
+    """API にリクエストしてきた人（ログインしている人）。JWT の中身から作る。"""
 
     sub: str  # Cognito のユーザーID。items.registered_by に入れる値
     groups: list[str]  # 所属するグループ（staff / admin）。認可（8d）に使う
@@ -103,7 +103,8 @@ def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
     ルートには1行で書けるようにする（書き忘れると誰でもできてしまうので、短く書けることが大事）。
 
     これ自体も Depends(get_current_user) を使うので、FastAPI は get_current_user（401 の確認）を先に呼ぶ。
-    ここに来た時点で「誰か」は分かっていて、確かめるのは「admin か」だけ。
+    ここに来た時点でログインは確かめ終わっていて「誰か」は分かっている。
+    ここで確かめるのは、その人が Cognito の admin グループに入っているかだけ。
     """
     if not is_admin(user):
         raise HTTPException(status_code=403, detail="admin だけができる操作です")
@@ -114,5 +115,5 @@ def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
 
 
 def is_admin(user: User) -> bool:
-    """admin のグループに入っていれば True。"""
+    """その人が Cognito の admin グループに入っていれば True、入っていなければ False。"""
     return ADMIN_GROUP in user.groups

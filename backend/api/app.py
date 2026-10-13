@@ -38,7 +38,7 @@ app.include_router(items.router)
 # ルートの関数がこの例外を捕まえなければ、FastAPI がここに渡してくれる。
 @app.exception_handler(DatabaseResumingError)
 async def db_resuming(request: Request, exc: DatabaseResumingError) -> JSONResponse:
-    """DB が一時停止から起きなかった。数秒後にやり直してもらう。
+    """DB（Aurora）が一時停止から起きなかったときに呼ばれる。503 を返し、数秒後にやり直してもらう。
 
     async def は FastAPI の例に合わせただけ（中で何も待たないので、動きは普通の関数と同じ）。
     """
@@ -51,7 +51,10 @@ async def db_resuming(request: Request, exc: DatabaseResumingError) -> JSONRespo
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """生きているかを返すだけ。API Gateway では認証なしのルートにする（8b-4）。"""
+    """API が動いているかを確かめるためのルート。{"status": "ok"} を返すだけ。
+
+    ログインしなくても呼べるように、API Gateway では認証なしのルートにする（8b-4）。
+    """
     return {"status": "ok"}
 
 

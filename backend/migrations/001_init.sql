@@ -19,7 +19,7 @@ CREATE TABLE requests (
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 拾得物。写真1枚につき1行。
+-- 拾得物（施設で拾われた落とし物）の表。写真1枚につき1行。
 CREATE TABLE items (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -71,7 +71,7 @@ CREATE TABLE items (
   -- status とは別の軸（確定済みでも照合済みでも届出の有無はありうる）なので、別の列にしている。
   police_reported_at TIMESTAMPTZ,
 
-  -- 一致した問い合わせ。status = 'matched' になったときに入れる。
+  -- この拾得物と一致した、落とし主の問い合わせ（requests の id）。status = 'matched' になったときに入れる。
   -- 拾得物を返せる相手は1人だけなので、items 側に1列で持つ
   --（1つの問い合わせが複数の拾得物に当たるのは許す。カバンと鍵が別々に見つかる、など）。
   -- 候補の一覧はその場でベクトル検索して出すだけなので保存しない。

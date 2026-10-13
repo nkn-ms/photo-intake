@@ -43,7 +43,7 @@ export async function logOut(): Promise<void> {
 }
 
 /**
- * 今のアクセストークン。ログインしていなければ null。
+ * API に付けて送るアクセストークンを返す。ログインしていなければ null。
  *
  * 期限が近ければ、Amplify がリフレッシュトークンで取り直してから返す。
  * API に送るのはアクセストークン（ID トークンは API の auth.py が 401 で弾く）。

@@ -1,4 +1,10 @@
-"""拾得物（items）のルート。登録（8c）・一覧と詳細（8d-1）・確定（8d-2）。"""
+"""拾得物（items）を扱う API のルートをまとめたファイル。
+
+登録 … POST /items（8c）
+一覧 … GET /items（8d-1）
+詳細 … GET /items/{item_id}（8d-1）
+確定 … POST /items/{item_id}/confirm（8d-2。admin だけ）
+"""
 
 from __future__ import annotations
 
@@ -82,17 +88,18 @@ EXTENSIONS: dict[str, str] = {
 
 
 class NewItem(BaseModel):
-    """登録のときに受け取るもの（リクエストの本文）。"""
+    """登録（POST /items）のときに、画面から受け取る値（リクエストの本文）。"""
 
     content_type: ContentType  # これから PUT する写真の形式
-    location: str | None = None  # 拾得場所
-    registered_at: datetime | None = None  # 拾得日時。省略したら今。保管期限（＋3か月）の起点
+    location: str | None = None  # 拾得場所（任意。送られなければ None）
+    # 拾得日時（任意）。省略したら登録した時刻にする。保管期限（＋3か月）を数える起点
+    registered_at: datetime | None = None
 
 
 class CreatedItem(BaseModel):
-    """登録の結果（レスポンスの本文）。"""
+    """登録（POST /items）の結果として、画面に返す値（レスポンスの本文）。"""
 
-    item_id: str  # 作った行の ID
+    item_id: str  # 作った items の行の ID（UUID）
     upload_url: str  # 写真を PUT する先（署名付きURL）
     upload_headers: dict[
         str, str
@@ -152,7 +159,7 @@ def insert_item(s3_key: str, registered_by: str, new_item: NewItem) -> str:
             {"name": "location", "value": text_or_null(new_item.location)},  # 任意。無ければ NULL
         ],
     )
-    # returning id の結果。1行目の1列目
+    # RETURNING id で返ってきた値を取り出す。結果の1行目の1列目が、作った行の ID
     item_id: str = response["records"][0][0]["stringValue"]
     return item_id
 
@@ -183,7 +190,10 @@ LIST_LIMIT = 50
 
 
 class ItemSummary(BaseModel):
-    """一覧の1件。どれが何かがひと目で分かるだけの列。"""
+    """一覧（GET /items）で返す1件分の値。
+
+    どの拾得物かがひと目で分かるだけの列に絞っている（すべての列は詳細の ItemDetail で返す）。
+    """
 
     id: str
     status: ItemStatus
@@ -200,7 +210,7 @@ class ItemSummary(BaseModel):
 # dependencies=[...]：ログインしていることだけ確かめる（誰かという値はこのルートでは使わない）
 @router.get("/items", dependencies=[Depends(get_current_user)])
 def list_items(status: ItemStatus | None = None) -> list[ItemSummary]:
-    """拾得物の一覧。拾得日時の新しい順。?status=pending_review のように状態で絞れる。"""
+    """拾得物の一覧を返す。拾得日時の新しい順。?status=pending_review のように状態で絞れる。"""
     rows = select_items(status)
     return [ItemSummary.model_validate(row) for row in rows]
 
@@ -221,7 +231,10 @@ LIMIT {LIST_LIMIT}
 
 
 def select_items(status: str | None) -> list[dict[str, Any]]:
-    """一覧の行を読む。"""
+    """一覧に出す行を DB から読む。
+
+    status が None なら全件、値があればその状態の行だけ。拾得日時の新しい順に、最大 LIST_LIMIT 件。
+    """
     return select_rows(SELECT_ITEMS_SQL, [{"name": "status", "value": text_or_null(status)}])
 
 
@@ -231,14 +244,17 @@ def select_items(status: str | None) -> list[dict[str, Any]]:
 
 
 class ItemDetail(BaseModel):
-    """詳細。AI の答え（ai_〜）と、人が確定した値（category など）を分けたまま返す。"""
+    """詳細（GET /items/{item_id}）と、確定の後に返す値。
+
+    AI の答え（ai_〜）と、人が確定した値（category など）を分けたまま返す。
+    """
 
     id: str
     status: ItemStatus
     photo_url: str  # 写真を見るための署名付きURL（GET）
     registered_at: UtcDatetime
     location: str | None
-    registered_by: str  # 登録した人の sub
+    registered_by: str  # 登録した人の sub（Cognito のユーザー ID）
 
     # ▼ AI の答え。人が直しても上書きしない（ここと人の値の差が「AI の間違い」）
     ai_result: dict[str, Any] | None
@@ -255,9 +271,11 @@ class ItemDetail(BaseModel):
     confirmed_at: UtcDatetime | None
     retention_deadline: date | None  # 保管期限（拾得日 + 3か月）
 
-    police_reported_at: UtcDatetime | None
+    # ▼ 確定の後の手続き（まだ書き込む処理が無いので、今はいつも null）
+    police_reported_at: UtcDatetime | None  # 警察に届け出た日時
+    # 落とし主の問い合わせ（遺失届）と結び付いたときの、その ID（ステップ10）
     matched_request_id: str | None
-    matched_at: UtcDatetime | None
+    matched_at: UtcDatetime | None  # 結び付けた日時
     created_at: UtcDatetime
     updated_at: UtcDatetime
 
@@ -267,7 +285,7 @@ class ItemDetail(BaseModel):
 
 @router.get("/items/{item_id}", dependencies=[Depends(get_current_user)])
 def get_item(item_id: uuid.UUID) -> ItemDetail:
-    """拾得物の詳細。写真を見るための署名付きURLを付けて返す。
+    """拾得物1件の詳細を返す。写真を見るための署名付きURLも付ける。
 
     item_id を uuid.UUID 型にしているので、UUID の形でなければ FastAPI が 422 で弾く（DB まで行かない）。
     """
@@ -381,7 +399,7 @@ def confirm_item(
 
 
 def is_confirmable(status: str) -> bool:
-    """確定できる状態なら True。"""
+    """その状態の拾得物を確定できるなら True（pending_review・analysis_failed のとき）。"""
     return status in CONFIRMABLE_STATUSES
 
 

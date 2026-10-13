@@ -10,7 +10,7 @@ export AWS_PROFILE
 whoami:          ## いまどのアカウント・どのロールで作業しているか
 	aws sts get-caller-identity
 
-login:           ## セッション（4時間）が切れたら打ち直す
+login:           ## AWS にログインする（SSO）。セッション（4時間）が切れたら打ち直す
 	aws sso login
 
 # --- AWS に触らない ---
@@ -32,7 +32,7 @@ plan: build-api  ## 何が変わるかを表示するだけ。変更しない
 apply: build-api ## 実際に AWS に反映する。yes の入力を求められる
 	$(TF) apply
 
-destroy: build-api ## 作ったものを消す
+destroy: build-api ## Terraform で作ったものを AWS から全部消す
 	$(TF) destroy
 
 # --- 動作確認用 ---
@@ -48,7 +48,7 @@ DLQ    = $(shell $(AWSP) sqs get-queue-url --queue-name photo-intake-dev-ingest-
 # ファイルを1つ置いて通知を発火させる。FILE= で差し替えられる。
 #   make upload FILE=~/Desktop/photo.jpg
 FILE ?= /tmp/test.txt
-upload:           ## uploads/ にファイルを置く
+upload:           ## S3 の uploads/ にファイルを置く
 	@test -f $(FILE) || echo "test" > $(FILE)
 	aws s3 cp $(FILE) s3://$(BUCKET)/uploads/$(notdir $(FILE))
 
