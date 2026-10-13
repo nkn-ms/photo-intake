@@ -2,7 +2,7 @@
  * API（API Gateway → Lambda の FastAPI）を呼ぶ処理。
  *
  * 画面の部品は fetch を直接書かず、ここの関数（getMe など）を呼ぶ。
- * アクセストークンを付ける・エラーを ApiError にそろえる、を request の1か所にまとめる。
+ * アクセストークンを付ける・エラーを ApiError にそろえる・DB の起動を待って出し直す、を request の1か所にまとめる。
  */
 import { getAccessToken } from './auth'
 
@@ -171,9 +171,17 @@ export async function uploadPhoto(created: CreatedItem, photo: Blob): Promise<vo
 // 共通の処理
 // ===========================================================================
 
+// DB の起動を待つ時間の上限。5分止まった後は約18秒、一晩止まった後は30秒を超えた（2026-10-13 に測った）。
+// それより長めに取り、これを過ぎたら待つのをやめて 503 の ApiError を投げる（画面に「DB が起動中です…」が出る）
+const DB_WAKE_LIMIT_MS = 90_000
+
 /**
- * API を1回呼ぶ。アクセストークンがあれば Authorization: Bearer に付ける。
+ * API を呼ぶ。アクセストークンがあれば Authorization: Bearer に付ける。
  * 2xx なら本文（JSON）を返し、それ以外なら ApiError を投げる。
+ *
+ * DB が起動中（Retry-After の付いた 503）なら、その秒数だけ待って同じリクエストを出し直す。
+ * API（db.py）は待たずにすぐ 503 を返すので、待つのはここの役目。
+ * 起動中のときは SQL がまだ実行されていないので、POST を出し直しても同じ行が2つできることはない。
  */
 async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
   const token = await getAccessToken()
@@ -185,16 +193,36 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
     headers['Content-Type'] = 'application/json'
   }
 
-  // VITE_API_URL は末尾が / なので、path の先頭の / を外してつなぐ（Makefile の make call と同じ）
-  const response = await fetch(import.meta.env.VITE_API_URL + path.replace(/^\//, ''), {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  })
-  if (!response.ok) {
-    throw await toApiError(response)
+  const giveUpAt = Date.now() + DB_WAKE_LIMIT_MS
+  // 返事が「DB が起動中」の間だけ繰り返す。それ以外は、どの返事でも return か throw でループを抜ける
+  while (true) {
+    // VITE_API_URL は末尾が / なので、path の先頭の / を外してつなぐ（Makefile の make call と同じ）
+    const response = await fetch(import.meta.env.VITE_API_URL + path.replace(/^\//, ''), {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    })
+    if (response.ok) {
+      return (await response.json()) as T
+    }
+
+    const error = await toApiError(response)
+    // Retry-After の付いた 503 だけが「DB が起動中」（app.py の例外ハンドラー）。それ以外のエラーは待たずに投げる
+    if (error.status !== 503 || error.retryAfterSeconds === null) {
+      throw error
+    }
+    const waitMs = error.retryAfterSeconds * 1000
+    // 待ってから出し直すと上限を過ぎるなら、あきらめる
+    if (Date.now() + waitMs > giveUpAt) {
+      throw error
+    }
+    await sleep(waitMs)
   }
-  return (await response.json()) as T
+}
+
+/** 指定したミリ秒だけ待つ。setTimeout を await で待てる形にしたもの */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**

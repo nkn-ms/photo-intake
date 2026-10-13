@@ -8,7 +8,7 @@
 ■ DB
   Data API を呼ぶところ（db.rds_data.execute_statement）だけを偽物に差し替える。
   偽物は、送られた SQL と値を記録し、決めておいた答えを順に返す。
-  execute_sql・select_rows・DB の起動待ち・例外ハンドラーは本物のまま動く。
+  execute_sql・select_rows・例外ハンドラーは本物のまま動く。
 
 ■ S3
   署名付きURLは AWS に問い合わせずに作れる（偽の認証情報で署名するだけ）ので、偽物は要らない。
@@ -131,10 +131,9 @@ class FakeDataApi:
 
 @pytest.fixture
 def data_api(monkeypatch: pytest.MonkeyPatch) -> FakeDataApi:
-    """Data API を偽物に差し替える。DB の起動待ちの間隔は 0秒にする（テストで本当に5秒待たない）。"""
+    """Data API を偽物に差し替える。"""
     fake = FakeDataApi()
     monkeypatch.setattr(db.rds_data, "execute_statement", fake)
-    monkeypatch.setattr(db, "DB_RESUME_WAIT_SECONDS", 0)
     return fake
 
 
@@ -343,7 +342,7 @@ def test_種別が空なら422でDBに触らない(data_api):
 
 
 # ===========================================================================
-# DB が起きない（app.py の例外ハンドラー）
+# DB が起動中（db.py は待たずに例外を投げ、app.py の例外ハンドラーが 503 にする）
 # ===========================================================================
 
 
@@ -355,22 +354,11 @@ def test_種別が空なら422でDBに触らない(data_api):
         ("GET", f"/items/{ITEM_ID}", None),
     ],
 )
-def test_DBが起きなければどのルートでも503とRetryAfter(data_api, method, path, body):
-    # 起動待ちの上限の回数だけ、ずっと「起きる途中」を返す
-    data_api.answers = [db_resuming() for _ in range(db.DB_RESUME_MAX_ATTEMPTS)]
+def test_DBが起動中ならどのルートでも送り直さずに503とRetryAfter(data_api, method, path, body):
+    data_api.answers = [db_resuming()]  # 1回目から「起動中」を返す
 
     status, _, headers = call(method, path, claims=STAFF, body=body)
 
     assert status == 503
-    assert headers["retry-after"] == "5"
-    assert len(data_api.calls) == db.DB_RESUME_MAX_ATTEMPTS  # あきらめる前に、上限まで送り直した
-
-
-def test_DBが途中で起きれば待ったうえで普通に返す(data_api):
-    data_api.answers = [db_resuming(), db_resuming(), rows()]  # 3回目で起きた
-
-    status, body, _ = call("GET", "/items", claims=STAFF)
-
-    assert status == 200
-    assert body == []
-    assert len(data_api.calls) == 3
+    assert headers["retry-after"] == "5"  # 画面はこの秒数だけ待ってやり直す
+    assert len(data_api.calls) == 1  # Lambda の中では送り直さない（待つのは画面の役目）

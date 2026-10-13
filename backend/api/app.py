@@ -3,7 +3,7 @@
 ■ ファイルの分け方
   app.py（ここ）   … 入口。アプリを作り、ルーターをつなぎ、Lambda のエントリポイントを置く
   auth.py          … 認証。JWT の中身からリクエストしてきた人を作る
-  db.py            … SQL を送る共通の処理（Data API・DB の起動待ち）
+  db.py            … SQL を送る共通の処理（Data API）
   routers/items.py … /items のルート
 
 ■ Mangum
@@ -14,7 +14,7 @@
   ルートの関数が指揮役。部品（read_〜・is_〜・make_〜・insert_〜）は値を返すだけで、例外を投げない。
   401・404 などの判断は、指揮役のガード節（if ...: raise）に並べる。
 
-  例外：DB が起きなかったとき（503）だけは、db.py が DatabaseResumingError を投げ、
+  例外：DB が起動中のとき（503）だけは、db.py が DatabaseResumingError を投げ、
   下の例外ハンドラーが受け取る。どのルートでも同じ 503 なので、ルートごとには書かない。
 """
 
@@ -38,7 +38,9 @@ app.include_router(items.router)
 # ルートの関数がこの例外を捕まえなければ、FastAPI がここに渡してくれる。
 @app.exception_handler(DatabaseResumingError)
 async def db_resuming(request: Request, exc: DatabaseResumingError) -> JSONResponse:
-    """DB（Aurora）が一時停止から起きなかったときに呼ばれる。503 を返し、数秒後にやり直してもらう。
+    """DB（Aurora）が一時停止から起動している途中のときに呼ばれる。503 を返し、数秒後にやり直してもらう。
+
+    やり直すのは画面（frontend/src/api.ts）。Retry-After の秒数だけ待ってから、同じリクエストを出し直す。
 
     async def は FastAPI の例に合わせただけ（中で何も待たないので、動きは普通の関数と同じ）。
     """

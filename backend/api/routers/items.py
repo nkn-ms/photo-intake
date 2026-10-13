@@ -311,7 +311,7 @@ WHERE id = CAST(:id AS UUID)
 def select_item(item_id: uuid.UUID) -> dict[str, Any] | None:
     """1件の行を読む。無ければ None（→ 指揮役が 404）。詳細と確定で使う。
 
-    None は「調べた結果、無い」だけを意味する（DB が起きないときは DatabaseResumingError が飛ぶ）。
+    None は「調べた結果、無い」だけを意味する（DB が起動中のときは DatabaseResumingError が飛ぶ）。
     """
     rows = select_rows(SELECT_ITEM_SQL, [{"name": "id", "value": {"stringValue": str(item_id)}}])
     return rows[0] if rows else None
