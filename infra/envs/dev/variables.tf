@@ -56,3 +56,13 @@ variable "token_validity_hours" {
     error_message = "token_validity_hours は 1〜24（Cognito が許す範囲）。"
   }
 }
+
+variable "enable_cloudfront" {
+  type        = bool
+  description = "画面の公開に CloudFront を使うか（false の間は作らない）"
+
+  # 2026-10-13：このアカウントは「確認が済むまで CloudFront を新しく作れない」状態（クレジットカードの支払いの確定待ち）。
+  # その間は画面を Cloudflare Workers で公開し、CloudFront のディストリビューションとそれに付くバケットポリシーを作らない。
+  # 解除されたら true にして make apply → make deploy-web の公開先を S3 に戻す。
+  default = false
+}

@@ -314,7 +314,7 @@ items:            ## 最近登録した items を5件表示する
 	  --query formattedRecords --output text | python3 -m json.tool --no-ensure-ascii
 
 # --- フロント（ステップ9）---
-.PHONY: web-env
+.PHONY: web-env deploy-web
 
 # 画面が使う値を、Terraform の出力から frontend/.env.local に書き出す（AWS には触らない。ローカルの state を読むだけ）。
 # destroy → apply のたびに User Pool の ID・API の URL が変わるので、apply の後に打ち直す。
@@ -331,3 +331,13 @@ web-env:          ## 画面が使う値（User Pool・クライアント・API �
 	  echo "VITE_API_URL=$(API_URL)"; \
 	} > $(WEB_ENV)
 	@echo "書き出した: $(WEB_ENV)"; cat $(WEB_ENV)
+
+# 画面をビルドして Cloudflare Workers に公開する（9e。AWS アカウントの確認待ちで CloudFront を作れない間の代わり）。
+#   npm run build   … 型チェックをしてから frontend/dist に公開用のファイルを作る。
+#                     Vite はここで .env.local を読むので、make web-env の値がそのまま JS に入る
+#   wrangler deploy … frontend/wrangler.jsonc を読み、dist を Cloudflare に上げて公開する
+#                     （https://photo-intake.<workers.dev の名前>.workers.dev）
+# 初回だけ、先に cd frontend && npx wrangler login（ブラウザで Cloudflare にログイン）と、
+# ダッシュボードで workers.dev の名前（アカウントに1つ）の登録が要る。
+deploy-web:       ## 画面をビルドして Cloudflare Workers に公開する（CloudFront が使えない間の代わり）
+	cd frontend && npm run build && npx wrangler deploy

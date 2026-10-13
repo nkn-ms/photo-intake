@@ -984,10 +984,12 @@ locals {
   # API を呼んでよい・写真を PUT してよい画面のオリジン（API Gateway と uploads バケットの CORS で使う）:
   #   ・ローカルの開発サーバー（npm run dev）
   #   ・CloudFront で公開した画面（9e）
-  web_origins = [
-    "http://localhost:5173",
-    "https://${aws_cloudfront_distribution.web.domain_name}",
-  ]
+  #   ・Cloudflare Workers で公開した画面（CloudFront を作れない間の代わり。variables.tf の enable_cloudfront）
+  # CloudFront の URL は、作ったときだけ足す（for で「作った分だけ」並べる。作っていなければ空の一覧）
+  web_origins = concat(
+    ["http://localhost:5173", "https://photo-intake.nkn-ms.workers.dev"],
+    [for d in aws_cloudfront_distribution.web : "https://${d.domain_name}"],
+  )
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -1138,6 +1140,9 @@ data "aws_cloudfront_cache_policy" "caching_optimized" {
 # ディストリビューション：CloudFront の設定1つ分。作ると https://xxxx.cloudfront.net の URL が1つもらえる。
 # 作るのにも消すのにも数分かかる（世界中の拠点に設定を配るため）。
 resource "aws_cloudfront_distribution" "web" {
+  # count：作る数。enable_cloudfront が false なら 0 個（作らない）。以降は aws_cloudfront_distribution.web[0] で指す
+  count = var.enable_cloudfront ? 1 : 0
+
   enabled             = true
   comment             = "photo-intake-dev web"
   default_root_object = "index.html"     # https://xxxx.cloudfront.net/ で来たときに返すファイル
@@ -1200,6 +1205,8 @@ resource "aws_cloudfront_distribution" "web" {
 #   ①この CloudFront だけに、ファイルを読ませる（OAC の署名付きリクエストを受け付ける）
 #   ②HTTPS 以外のリクエストは拒否する（uploads と同じ文）
 resource "aws_s3_bucket_policy" "web" {
+  count = var.enable_cloudfront ? 1 : 0 # ①がディストリビューションを指すので、作るときだけ作る
+
   bucket = aws_s3_bucket.web.id
 
   policy = jsonencode({
@@ -1215,7 +1222,7 @@ resource "aws_s3_bucket_policy" "web" {
         # 「CloudFront なら何でも」ではなく「このディストリビューションからのみ」に絞る。
         # これが無いと、他人のアカウントの CloudFront からもこのバケットを読めてしまう（SQS のキューポリシーと同じ考え方）
         Condition = {
-          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.web.arn }
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.web[0].arn }
         }
       },
       {
@@ -1236,7 +1243,8 @@ resource "aws_s3_bucket_policy" "web" {
 
 # 画面を開く URL。スマホではこれを開く
 output "web_url" {
-  value = "https://${aws_cloudfront_distribution.web.domain_name}"
+  # one：要素が1個ならそれを、0個なら null を返す（CloudFront を作っていない間は null）
+  value = one([for d in aws_cloudfront_distribution.web : "https://${d.domain_name}"])
 }
 
 # make deploy-web が使う（ファイルを置く先と、キャッシュを消す相手）
@@ -1245,5 +1253,5 @@ output "web_bucket" {
 }
 
 output "web_distribution_id" {
-  value = aws_cloudfront_distribution.web.id
+  value = one(aws_cloudfront_distribution.web[*].id) # [*]：作った分の id を一覧にする
 }
