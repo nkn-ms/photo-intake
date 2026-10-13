@@ -1,13 +1,12 @@
 <script setup lang="ts">
-// 一番外側の部品。ログインしていなければフォーム、していれば登録の画面を出す。
-// 一覧・詳細の画面は 9d でここに足す
+// 一番外側の部品。ログインしていなければフォーム、していれば上部のメニューと、URL に応じたページを出す
 import { onMounted, ref } from 'vue'
-import { ApiError, getMe, type Me } from './api'
+import { RouterLink, RouterView } from 'vue-router'
+import { ApiError, getMe } from './api'
 import { getAccessToken, logOut } from './auth'
 import LoginForm from './components/LoginForm.vue'
-import RegisterForm from './components/RegisterForm.vue'
+import { me } from './session'
 
-const me = ref<Me | null>(null) // ログインしている人。null ならログインしていない
 const loading = ref(true)
 const error = ref<string | null>(null)
 
@@ -42,10 +41,25 @@ async function onLogOut(): Promise<void> {
   <!-- v-if / v-else-if / v-else：条件で出し分ける（React の三項演算子・&&） -->
   <p v-if="loading">読み込み中…</p>
   <LoginForm v-else-if="me === null" @logged-in="loadMe" />
-  <section v-else>
-    <p>ログイン中：{{ me.sub }}（{{ me.groups.join('・') }}）</p>
-    <button @click="onLogOut">ログアウト</button>
-    <RegisterForm />
-  </section>
+  <template v-else>
+    <nav>
+      <!-- RouterLink：ページを読み込み直さずに URL を切り替えるリンク（Next.js の <Link>） -->
+      <RouterLink to="/">登録</RouterLink>
+      <RouterLink to="/items">一覧</RouterLink>
+      <span>{{ me.groups.join('・') }}</span>
+      <button @click="onLogOut">ログアウト</button>
+    </nav>
+    <!-- RouterView：今の URL に対応するページ（router.ts の一覧）がここに出る -->
+    <RouterView />
+  </template>
   <p v-if="error" class="error">{{ error }}</p>
 </template>
+
+<style scoped>
+nav {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+</style>
