@@ -66,6 +66,33 @@ resource "aws_s3_bucket_cors_configuration" "uploads" {
   }
 }
 
+# バケットポリシー：HTTPS 以外のリクエストを全部拒否する（AWS が勧める定番の設定。9e で追加）。
+#
+# 署名付きURLの署名は https:// か http:// かを区別しないので、URL を http:// に書き換えても通ってしまいうる。
+# HTTP だと写真が暗号化されずに回線を流れる。aws:SecureTransport は「このリクエストは HTTPS か」を表す条件。
+# Deny（拒否）は Allow（許可）より強いので、誰がどんな権限を持っていても、HTTP なら断られる。
+# 画面・Lambda・aws コマンドはもともと HTTPS なので、困る人はいない。web バケットにも同じ文を書いている。
+resource "aws_s3_bucket_policy" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.uploads.arn, "${aws_s3_bucket.uploads.arn}/*"] # バケットそのものと、中のすべてのファイル
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+
+  # パブリックアクセスのブロックを先に入れてから、ポリシーを付ける（順番を Terraform に教える）
+  depends_on = [aws_s3_bucket_public_access_block.uploads]
+}
+
 # 画像の解析を後ろで回すためのキュー。
 #
 # 解析には数秒かかる。同期処理だとアップロードの応答がその分待たされるので、
@@ -954,9 +981,13 @@ resource "aws_apigatewayv2_api" "main" {
 }
 
 locals {
-  # API を呼んでよい画面のオリジン。今はローカルの開発サーバー（npm run dev）だけ。
-  # CloudFront で公開したら（9e）、その URL を足す。
-  web_origins = ["http://localhost:5173"]
+  # API を呼んでよい・写真を PUT してよい画面のオリジン（API Gateway と uploads バケットの CORS で使う）:
+  #   ・ローカルの開発サーバー（npm run dev）
+  #   ・CloudFront で公開した画面（9e）
+  web_origins = [
+    "http://localhost:5173",
+    "https://${aws_cloudfront_distribution.web.domain_name}",
+  ]
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -1051,4 +1082,168 @@ resource "aws_lambda_permission" "api_gateway" {
 
 output "api_url" {
   value = aws_apigatewayv2_stage.default.invoke_url
+}
+
+# ===========================================================================
+# 画面の公開（9e）：S3（ビルドした画面のファイル）+ CloudFront（配る窓口）
+# ===========================================================================
+#
+# npm run build で frontend/dist にできる index.html・JS・CSS を S3 に置き、CloudFront が世界中に配る。
+# Vite の SPA はサーバーで動く処理が無い（ファイルを返すだけ）ので、Lambda も EC2 も要らない。
+#
+#   ブラウザ ──HTTPS──→ CloudFront ──（OAC で署名）──→ S3（web バケット。公開しない）
+#
+# なぜ S3 を直接公開しないか:
+#   ・S3 の静的ウェブサイト機能は HTTP だけで、HTTPS にできない。
+#     HTTPS でないと、ログイン（Amplify の SRP）が使う暗号の機能（crypto.subtle）をブラウザが使わせない
+#     （localhost だけは例外で HTTP でも使える。だからローカルでは困らなかった）
+#   ・バケットを公開しないまま、CloudFront からだけ読ませられる（uploads と同じく、パブリックアクセスは全部ブロック）
+
+# ビルドした画面を置くバケット。写真の uploads とは分ける
+# （uploads は利用者が写真を PUT する場所、こちらは誰にでも配る画面。権限も中身の作り方も違う）。
+resource "aws_s3_bucket" "web" {
+  bucket = "photo-intake-dev-web-${data.aws_caller_identity.current.account_id}"
+
+  # 中にファイルが残っていても destroy で消せるようにする。
+  # uploads と違って、中身は make deploy-web でいつでも作り直せるので、消えて困るものが無い
+  force_destroy = true
+}
+
+# uploads と同じく、パブリックアクセスを全部ブロックする。
+# CloudFront に読ませる許可（後で書くバケットポリシー）は「公開」には当たらないので、これと両立する。
+resource "aws_s3_bucket_public_access_block" "web" {
+  bucket = aws_s3_bucket.web.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# OAC（Origin Access Control）：CloudFront が web バケットにファイルを取りに行くとき、リクエストに署名を付ける設定。
+# 署名を付けるだけでは何も守れない。バケットポリシー（下）に「この CloudFront の署名が付いたリクエストだけ読ませる」と書いて、組で使う。
+resource "aws_cloudfront_origin_access_control" "web" {
+  name                              = "photo-intake-dev-web"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always" # 毎回署名する
+  signing_protocol                  = "sigv4"  # AWS の署名の方式（署名付きURLと同じ）
+}
+
+# AWS が用意している「キャッシュの決め方」のひな形。名前で探して読むだけ（data なので何も作らない）。
+# CachingOptimized：URL だけでファイルを見分け、既定で1日（最長1年）エッジで覚えておく。静的なファイル向け
+data "aws_cloudfront_cache_policy" "caching_optimized" {
+  name = "Managed-CachingOptimized"
+}
+
+# ディストリビューション：CloudFront の設定1つ分。作ると https://xxxx.cloudfront.net の URL が1つもらえる。
+# 作るのにも消すのにも数分かかる（世界中の拠点に設定を配るため）。
+resource "aws_cloudfront_distribution" "web" {
+  enabled             = true
+  comment             = "photo-intake-dev web"
+  default_root_object = "index.html"     # https://xxxx.cloudfront.net/ で来たときに返すファイル
+  price_class         = "PriceClass_200" # 配る拠点の範囲。日本を含み、料金の高い一部の地域（南米など）を除く
+
+  # オリジン：ファイルを取りに行く元。web バケットを、上の OAC で署名して読む
+  origin {
+    origin_id                = "web" # このディストリビューションの中での名前（下の target_origin_id が指す）
+    domain_name              = aws_s3_bucket.web.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.web.id
+  }
+
+  # どの URL のリクエストも、このやり方で返す
+  default_cache_behavior {
+    target_origin_id       = "web"
+    viewer_protocol_policy = "redirect-to-https" # http:// で来たら https:// に転送する
+    allowed_methods        = ["GET", "HEAD"]     # 画面のファイルを読むだけなので、書き込みのメソッドは通さない
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true # JS・CSS を gzip / brotli で縮めて送る
+    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id
+  }
+
+  # SPA のための設定：バケットに無いパスでも index.html を返す。
+  #
+  # /items/9d46… を直接開くと（再読み込み・ブックマーク・リンクの共有）、CloudFront は S3 に
+  # 「items/9d46…」というファイルを取りに行くが、そんなファイルは無い。そのまま返すとエラーの画面になる。
+  # 代わりに index.html を 200 で返せば、ブラウザで vue-router が URL を見て詳細ページを出す
+  # （router.ts の createWebHistory のコメントで「9e で要る」と書いた設定。ローカルでは Vite が同じことをしていた）。
+  #
+  # 404 だけでなく 403 も書くのは、S3 が「無い」を 403 で返すため。CloudFront にはバケットの一覧を見る権限を
+  # 渡していないので、S3 は「無い」のか「読めない」のかを言わずに 403 にする（何があるかを外から探られないように）。
+  #
+  # 割り切り：本当に無いファイル（消えた古い JS など）を頼まれても、index.html が 200 で返る。
+  # 分けたくなったら、拡張子の無いパスだけを index.html に書き換える CloudFront Functions に切り替える。
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  # 国による制限はしない（書く決まりのブロック）
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  # HTTPS の証明書は CloudFront の既定（*.cloudfront.net）を使う。自分のドメインを使うときは ACM の証明書に替える
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+
+# web バケットのバケットポリシー（2つの文）:
+#   ①この CloudFront だけに、ファイルを読ませる（OAC の署名付きリクエストを受け付ける）
+#   ②HTTPS 以外のリクエストは拒否する（uploads と同じ文）
+resource "aws_s3_bucket_policy" "web" {
+  bucket = aws_s3_bucket.web.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowCloudFrontRead"
+        Effect    = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action    = "s3:GetObject" # 読むだけ。一覧（ListBucket）は渡さない（だから無いファイルは 403 になる）
+        Resource  = "${aws_s3_bucket.web.arn}/*"
+
+        # 「CloudFront なら何でも」ではなく「このディストリビューションからのみ」に絞る。
+        # これが無いと、他人のアカウントの CloudFront からもこのバケットを読めてしまう（SQS のキューポリシーと同じ考え方）
+        Condition = {
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.web.arn }
+        }
+      },
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [aws_s3_bucket.web.arn, "${aws_s3_bucket.web.arn}/*"]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      },
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.web]
+}
+
+# 画面を開く URL。スマホではこれを開く
+output "web_url" {
+  value = "https://${aws_cloudfront_distribution.web.domain_name}"
+}
+
+# make deploy-web が使う（ファイルを置く先と、キャッシュを消す相手）
+output "web_bucket" {
+  value = aws_s3_bucket.web.id
+}
+
+output "web_distribution_id" {
+  value = aws_cloudfront_distribution.web.id
 }
