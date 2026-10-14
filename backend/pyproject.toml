@@ -27,7 +27,7 @@ dev = [
     "mypy",
     "ruff",
     "httpx",
-    "types-boto3[bedrock-runtime,rds-data,s3]>=1.43.108",
+    "types-boto3[bedrock-runtime,rds-data,s3,secretsmanager]>=1.43.108",
     "uvicorn>=0.54.0",
 ]
 

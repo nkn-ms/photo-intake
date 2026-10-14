@@ -4,7 +4,9 @@
 ここでは同じことを数秒・課金なしで、何度でもやり直せる。
 """
 
+import io
 import json
+import urllib.error
 
 import boto3
 import pytest
@@ -249,3 +251,102 @@ def test_同じ通知を別の実行が処理中なら待たずに終わる(work
     assert results_of_second == [{"ok": True}]
     assert first == {"ok": True}
     assert [sql for sql, _ in sent_sql] == [worker.UPDATE_SQL]  # 保存したのは1つ目だけ
+
+
+# --- Claude API（ask_claude_api）---
+# 本物の api.anthropic.com には送らない。urllib.request.urlopen（HTTPS を送る関数）を偽物に差し替え、
+# 「何を送ろうとしたか」と「返事ごとの分かれ道」を確かめる。キーも Secrets Manager から読まずに決め打ちにする。
+
+
+class FakeResponse(io.BytesIO):
+    """urlopen の返事の偽物。with で使えて、json.load で読める（BytesIO がどちらもできる）。"""
+
+
+@pytest.fixture
+def claude_api(worker, monkeypatch):
+    """Claude API の呼び出しを偽物にする。戻り値の dict の "requests" に、送ろうとしたリクエストが入る。
+
+    "answer" に返事を入れておく：dict なら 200 の本文、HTTPError ならその例外を投げる。
+    """
+    fake: dict = {"requests": [], "answer": None}
+
+    def fake_urlopen(request, timeout):
+        fake["requests"].append(request)
+        if isinstance(fake["answer"], Exception):
+            raise fake["answer"]
+        return FakeResponse(json.dumps(fake["answer"]).encode())
+
+    monkeypatch.setattr(worker.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(worker, "anthropic_api_key", lambda: "test-key")
+    monkeypatch.setattr(worker, "ANTHROPIC_MODEL_ID", "claude-haiku-5-5")
+    return fake
+
+
+def http_error(status: int) -> urllib.error.HTTPError:
+    """Claude API が 2xx 以外を返したときに urlopen が投げる例外を真似る。"""
+    body = io.BytesIO(b'{"type": "error", "error": {"type": "x", "message": "y"}}')
+    return urllib.error.HTTPError("https://api.anthropic.com/v1/messages", status, "", {}, body)
+
+
+def test_ClaudeAPIには写真とキーとモデル名を送り答えの文字列を返す(claude_api, worker):
+    # Haiku 5.5 は考えた跡（thinking）を先頭に付けて返すことがある。答えはその後ろの text の部品
+    claude_api["answer"] = {
+        "content": [
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            {"type": "text", "text": GOOD_ANSWER},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1600, "output_tokens": 60},
+    }
+
+    answer = worker.ask_claude_api(b"fake image bytes", "jpeg")
+
+    assert answer == GOOD_ANSWER
+    request = claude_api["requests"][0]
+    assert request.full_url == "https://api.anthropic.com/v1/messages"
+    # ヘッダーの名前は urllib が先頭だけ大文字に直して持つ
+    assert request.get_header("X-api-key") == "test-key"
+    assert request.get_header("Anthropic-version") == "2023-06-01"
+    body = json.loads(request.data)
+    assert body["model"] == "claude-haiku-5-5"
+    # Haiku 5.5 は temperature を 1 以外にすると 400 で断るので、送らない
+    assert "temperature" not in body
+    image = body["messages"][0]["content"][0]
+    # 拡張子から決めた形式を MIME の形にして送る
+    assert image["source"]["media_type"] == "image/jpeg"
+
+
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_答えの文字が無い返事は恒久的な失敗にする(claude_api, worker, stop_reason):
+    # refusal 断られた・max_tokens 考えている途中で上限に届いた。どちらも送り直しても同じ
+    claude_api["answer"] = {
+        "content": [{"type": "thinking", "thinking": "", "signature": "sig"}],
+        "stop_reason": stop_reason,
+        "usage": {"input_tokens": 1600, "output_tokens": 2048},
+    }
+
+    with pytest.raises(worker.PermanentError):
+        worker.ask_claude_api(b"fake image bytes", "jpeg")
+
+
+def test_ClaudeAPIが400を返したら恒久的な失敗にする(claude_api, worker):
+    claude_api["answer"] = http_error(400)  # 送った中身の誤り。送り直しても同じ
+
+    with pytest.raises(worker.PermanentError):
+        worker.ask_claude_api(b"fake image bytes", "jpeg")
+
+
+@pytest.mark.parametrize("status", [429, 500, 529, 401])
+def test_ClaudeAPIの混雑やサーバーの失敗は一時的な失敗として投げる(claude_api, worker, status):
+    # 429 混雑・500 サーバーの失敗・529 過負荷・401 キーの誤り。PermanentError にはせず、SQS にやり直してもらう
+    claude_api["answer"] = http_error(status)
+
+    with pytest.raises(urllib.error.HTTPError):
+        worker.ask_claude_api(b"fake image bytes", "jpeg")
+
+
+def test_答えがコードブロックで囲まれていても中のJSONを読む(worker):
+    # 「JSON だけ」と頼んでも、モデルは ```json … ``` で囲んで返すことがある
+    answer = "```json\n" + GOOD_ANSWER + "\n```"
+
+    assert worker.parse_answer(answer) == json.loads(GOOD_ANSWER)

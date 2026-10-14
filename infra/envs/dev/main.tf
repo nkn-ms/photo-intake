@@ -482,6 +482,32 @@ resource "aws_iam_role_policy" "worker_idempotency" {
   })
 }
 
+# Anthropic の API キーを入れるシークレット（2026-10-13：Bedrock が使えない間、Claude API を直接呼ぶため）。
+#
+# Terraform が作るのは「入れ物」だけで、キーの値は書かない。値は作者が CLI（aws secretsmanager put-secret-value）で入れる。
+# こうすると、キーが tfstate にもコードにも残らない（DB のパスワードを Secrets Manager に生成させたのと同じ考え方）。
+resource "aws_secretsmanager_secret" "anthropic_api_key" {
+  name = "photo-intake-dev/anthropic-api-key"
+
+  # destroy したらすぐ消す。既定（7〜30日の猶予）のままだと、その間は同じ名前で作り直せず、destroy → apply が失敗する
+  recovery_window_in_days = 0
+}
+
+# 【権限ポリシー その7】Anthropic の API キーを読む。
+resource "aws_iam_role_policy" "worker_anthropic_key" {
+  name = "read-anthropic-api-key" # ポリシーの名前
+  role = aws_iam_role.worker.name # このポリシーを与えるロール
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.anthropic_api_key.arn # ★このシークレットだけ
+    }]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # worker Lambda 本体
 # ---------------------------------------------------------------------------
@@ -549,8 +575,13 @@ resource "aws_lambda_function" "worker" {
       # handler.py は os.environ["VISION_MODEL_ID"] で読むので、これが無いと起動時に落ちる。
       VISION_MODEL_ID = "jp.${var.vision_model_id}"
 
-      # bedrock / dummy の切り替え。variables.tf の analyzer を参照
+      # anthropic / bedrock / dummy の切り替え。variables.tf の analyzer を参照
       ANALYZER = var.analyzer
+
+      # analyzer = anthropic のときに使う。キーそのものではなく、キーが入ったシークレットの場所（ARN）を渡す。
+      # キーを環境変数に直接入れると、Lambda のコンソールで誰でも読めてしまう
+      ANTHROPIC_MODEL_ID           = var.anthropic_model_id
+      ANTHROPIC_API_KEY_SECRET_ARN = aws_secretsmanager_secret.anthropic_api_key.arn
 
       # Data API に渡す3点セット（make sql と同じもの）。
       # ARN は「置き場所」であって秘密ではないので、環境変数に入れてよい。

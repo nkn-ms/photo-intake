@@ -28,17 +28,29 @@ variable "vision_model_id" {
 
 variable "analyzer" {
   type        = string
-  description = "bedrock なら本物のモデルを呼ぶ。dummy なら呼ばずに決め打ちの答えを返す"
+  description = "写真を解析する先。anthropic＝Claude API、bedrock＝Bedrock、dummy＝呼ばずに決め打ちの答え"
 
-  # このアカウントでは Bedrock のモデル呼び出しが止められている（サポート待ち）。
-  # それまで dummy で保存の流れを作り、解除されたら bedrock に戻す。
-  default = "dummy"
+  # このアカウントでは Bedrock のモデル呼び出しが止められている（サポート待ち。クレジットカードの支払いの確定が要る見込み）。
+  # 2026-10-13 から Anthropic の API を直接呼ぶ（anthropic）。解除されたら bedrock に戻せる（写真が AWS の外に出ないため）。
+  default = "anthropic"
 
   # 決まった値以外を渡したら、plan の時点で止める（打ち間違いを apply まで持ち込まない）
   validation {
-    condition     = contains(["bedrock", "dummy"], var.analyzer)
-    error_message = "analyzer は bedrock か dummy のどちらか。"
+    condition     = contains(["anthropic", "bedrock", "dummy"], var.analyzer)
+    error_message = "analyzer は anthropic・bedrock・dummy のどれか。"
   }
+}
+
+variable "anthropic_model_id" {
+  type        = string
+  description = "analyzer = anthropic のときに使うモデル（Anthropic の API のモデル名）"
+
+  # Claude Haiku 5.5（2026-10-07 公開）。写真から種別・色・ブランド・特徴を取り出す程度なら十分で、いちばん安くて速い。
+  # 入力 $0.10・出力 $0.50（100万トークンあたり）で、Haiku 4.5 の1/10。
+  # handler.py の ask_claude_api は 5.5 向けに書いてある（temperature を送らない・effort を送る）ので、
+  # 4.5 以前に戻すときは handler.py も直す。
+  # Bedrock のモデルID（anthropic.claude-haiku-5-5）とは書き方が違うので、vision_model_id とは分けている
+  default = "claude-haiku-5-5"
 }
 
 variable "token_validity_hours" {

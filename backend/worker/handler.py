@@ -1,6 +1,6 @@
 """SQS から S3 のイベントを受け取る worker。
 
-写真を Bedrock のモデルに渡し、返ってきた答えを items に保存する。
+写真をモデル（Claude API か Bedrock。環境変数 ANALYZER で選ぶ）に渡し、返ってきた答えを items に保存する。
 
 失敗は2種類に分けて扱う:
   ・恒久的な失敗（何度やっても同じ）→ その場で analysis_failed にする。例外は投げない
@@ -15,10 +15,14 @@ Powertools が中でやっていることは docs/idempotency-by-hand.md に、�
 # 下の TYPE_CHECKING の中でしか import しない型を、注釈に書けるようにするため。
 from __future__ import annotations
 
+import base64
+import functools
 import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
@@ -53,6 +57,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime")
 rds_data = boto3.client("rds-data")  # Data API（HTTPS で SQL を送る）
+secrets = boto3.client("secretsmanager")  # Anthropic の API キーを読む
 
 # 冪等性の記録先。Terraform が作った DynamoDB のテーブル（列の名前 id / expiration は Powertools の既定）
 idempotency_store = DynamoDBPersistenceLayer(table_name=os.environ["IDEMPOTENCY_TABLE"])
@@ -83,12 +88,18 @@ VISION_MODEL_ID = os.environ["VISION_MODEL_ID"]
 # この回数目の配信で失敗したら、次は DLQ に落ちる＝最終試行。
 MAX_RECEIVE_COUNT = int(os.environ["MAX_RECEIVE_COUNT"])
 
-# "bedrock" なら本物のモデルを呼ぶ。"dummy" なら呼ばずに決め打ちの答えを返す。
-# アカウントで Bedrock が止められている間（サポート待ち）も、保存の流れを先に作るため。
+# 写真をどこに渡すか:
+#   "anthropic" … Anthropic の API（Claude）を直接呼ぶ。2026-10-13 から（Bedrock が止められている間）
+#   "bedrock"   … Bedrock のモデルを呼ぶ。写真が AWS の外に出ないので、解除されたらこちらに戻せる
+#   "dummy"     … 呼ばずに決め打ちの答えを返す（保存の流れを先に作るために使った）
 ANALYZER = os.environ.get("ANALYZER", "bedrock")
 
-# items.ai_model に記録する名前。ダミーの行を後から見分けて、精度の集計から外せるようにする。
-AI_MODEL = "dummy" if ANALYZER == "dummy" else VISION_MODEL_ID
+# Claude API で使うモデルと、API キーが入ったシークレットの場所（Terraform が渡す。キーそのものは渡さない）
+ANTHROPIC_MODEL_ID = os.environ.get("ANTHROPIC_MODEL_ID", "")
+ANTHROPIC_API_KEY_SECRET_ARN = os.environ.get("ANTHROPIC_API_KEY_SECRET_ARN", "")
+
+# items.ai_model に記録する名前。どのモデルの答えかを後から見分けて、精度を比べたり、ダミーを集計から外したりする。
+AI_MODEL = {"dummy": "dummy", "anthropic": ANTHROPIC_MODEL_ID}.get(ANALYZER, VISION_MODEL_ID)
 
 # ダミーの答え。本物のモデルに頼んでいるのと同じ形にしておく。
 DUMMY_ANSWER = json.dumps(
@@ -318,15 +329,25 @@ def parse_answer(answer: str) -> dict[str, Any]:
     """モデルの答えを JSON として読む。読めなければ PermanentError。
 
     同じ写真・同じ temperature=0 で渡し直しても、同じ答えが返ってくるだけなので恒久的な失敗。
-    （本物のモデルは ```json で囲んで返すことがある。その扱いは Bedrock が使えるようになってから決める）
+    本物のモデルは「JSON だけ」と頼んでも ```json … ``` で囲んで返すことがあるので、囲みは外してから読む。
     """
     logger.info("model answer: %s", answer)
     try:
-        ai_result: dict[str, Any] = json.loads(answer)
+        ai_result: dict[str, Any] = json.loads(strip_code_fence(answer))
     except json.JSONDecodeError:
         # 答えの頭だけを残す。人が画面で見て「なぜ失敗したか」が分かるように
         raise PermanentError(f"モデルの答えが JSON として読めない: {answer[:200]}")
     return ai_result
+
+
+def strip_code_fence(answer: str) -> str:
+    """```json … ``` のような囲み（Markdown のコードブロック）があれば外す。無ければそのまま返す。"""
+    text = answer.strip()
+    if not text.startswith("```"):
+        return text
+    # 1行目（```json）を捨て、最後の ``` から後ろを捨てる
+    body = text.split("\n", 1)[1] if "\n" in text else ""
+    return body.rsplit("```", 1)[0].strip()
 
 
 # Aurora は5分使われないと一時停止し、次の SQL で起き始める。起きるまで十数秒かかり、
@@ -439,11 +460,17 @@ def mark_failed(key: str, reason: str) -> None:
 
 
 def ask_model(image_bytes: bytes, image_format: ImageFormatType) -> str:
-    """写真をモデルに渡して、答え（文字列）を返す。"""
+    """写真をモデルに渡して、答え（文字列）を返す。どこに渡すかは ANALYZER で決まる。"""
     if ANALYZER == "dummy":
-        logger.info("ANALYZER=dummy: Bedrock は呼ばずに決め打ちの答えを返す")
+        logger.info("ANALYZER=dummy: モデルは呼ばずに決め打ちの答えを返す")
         return DUMMY_ANSWER
+    if ANALYZER == "anthropic":
+        return ask_claude_api(image_bytes, image_format)
+    return ask_bedrock(image_bytes, image_format)
 
+
+def ask_bedrock(image_bytes: bytes, image_format: ImageFormatType) -> str:
+    """Bedrock（Converse API）に写真を渡す。"""
     # Converse API：モデルが変わっても同じ形で呼べる
     try:
         response = bedrock.converse(
@@ -469,3 +496,98 @@ def ask_model(image_bytes: bytes, image_format: ImageFormatType) -> str:
     usage = response["usage"]  # 入出力のトークン数。料金はこれで決まる
     logger.info("tokens: input=%d output=%d", usage["inputTokens"], usage["outputTokens"])
     return response["output"]["message"]["content"][0]["text"]
+
+
+# Claude API（Messages API）。SDK を使わず、Python の標準ライブラリ（urllib）で HTTPS の POST を1本送る。
+# 呼ぶのは「写真1枚と質問を送って、答えをもらう」1種類だけなので、ライブラリを zip に詰める手間をかけない
+# （呼ぶ種類が増えたら、公式の SDK（anthropic）に替える）。
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"  # API の版。ヘッダーで必ず送る決まり
+# 待つ上限の秒数。Haiku は数秒で答える。worker の制限時間（60秒）には、この後の DB の保存も入る
+ANTHROPIC_TIMEOUT_SECONDS = 30
+# 送り直しても同じ結果になる（恒久的な）HTTP の状態。それ以外（429 混雑・5xx・529 過負荷・401 キーの誤りなど）は
+# 一時的として SQS にやり直させる。401 は設定の誤りだが、DLQ に落ちてアラームのメールが来るので気づける
+ANTHROPIC_PERMANENT_STATUSES = {400, 413}  # 400 送った中身の誤り・413 大きすぎる
+
+
+def ask_claude_api(image_bytes: bytes, image_format: ImageFormatType) -> str:
+    """Anthropic の API（Claude）に写真を渡す。"""
+    # Claude Haiku 5.5 向けの書き方。temperature は送らない（5.5 は 1 以外を 400 で断る）。
+    # 5.5 は頼まなくても答える前に考える（考えた分も出力のトークンとして数えられ、料金がかかる）。
+    # 写真から項目を取り出すだけで深く考える必要はないので、effort（考える量）を low にして、考えるのを減らす
+    body = {
+        "model": ANTHROPIC_MODEL_ID,
+        # 考えた分も max_tokens に入る。小さいと、考えている途中で止まって答えが出ないので、余裕を持たせる
+        # （払うのは実際に使った分だけなので、上限を上げても料金は増えない）
+        "max_tokens": 2048,
+        "output_config": {"effort": "low"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        # 写真は base64（バイナリを文字だけで表す形）にして JSON に入れる
+                        "source": {
+                            "type": "base64",
+                            "media_type": f"image/{image_format}",  # jpeg → image/jpeg
+                            "data": base64.b64encode(image_bytes).decode("ascii"),
+                        },
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ],
+    }
+    request = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "x-api-key": anthropic_api_key(),
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=ANTHROPIC_TIMEOUT_SECONDS) as response:
+            message = json.load(response)
+    except urllib.error.HTTPError as e:
+        # HTTPError：返事は来たが 2xx でなかった。本文にエラーの理由（JSON）が入っている
+        if e.code in ANTHROPIC_PERMANENT_STATUSES:
+            raise PermanentError(f"Claude API が受け付けなかった（{e.code}）: {e.read()[:200]!r}")
+        raise  # 一時的な失敗。handler まで届き、SQS がやり直す
+    # URLError（つながらない）・タイムアウトは捕まえない。一時的な失敗として SQS にやり直してもらう
+
+    usage = message["usage"]  # 入出力のトークン数。料金はこれで決まる
+    logger.info(
+        "tokens: input=%d output=%d stop_reason=%s",
+        usage["input_tokens"],
+        usage["output_tokens"],
+        message["stop_reason"],
+    )
+    return answer_text(message)
+
+
+def answer_text(message: dict[str, Any]) -> str:
+    """Claude の返事から、答えの文字の部分を取り出す。
+
+    返事の content は部品（ブロック）の並びで、先頭が考えた跡（type が thinking）のこともある。
+    だから順番では選ばず、type が text の部品を探す。
+    文字の部品が無いのは、断られた（stop_reason が refusal）か、考えている途中で上限に届いた（max_tokens）とき。
+    同じ写真で送り直しても同じになるので、恒久的な失敗にする。
+    """
+    for block in message["content"]:
+        if block["type"] == "text":
+            text: str = block["text"]
+            return text
+    raise PermanentError(f"Claude の返事に答えの文字が無い（stop_reason={message['stop_reason']}）")
+
+
+# functools.cache：1回目に読んだ値を覚えておき、2回目からは Secrets Manager に聞かない。
+# Lambda は実行環境を使い回すので、使い回されている間は読み直さずに済む（読むたびに料金と時間がかかるため）。
+# 起動時（import のとき）ではなく初めて使うときに読むのは、dummy・bedrock のときは読まなくて済むようにするため
+@functools.cache
+def anthropic_api_key() -> str:
+    """Secrets Manager から Anthropic の API キーを読む。値がまだ入っていなければ例外（一時的な失敗として扱う）。"""
+    return secrets.get_secret_value(SecretId=ANTHROPIC_API_KEY_SECRET_ARN)["SecretString"]
