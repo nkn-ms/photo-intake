@@ -1,10 +1,25 @@
 // 拾得物1件の詳細を出す画面。写真と、AI の答えと人が確定した値を横に並べて出す。
 // admin が見ていて、確定できる状態なら、下に確定のフォーム（ConfirmForm）を出す
-import { useEffect, useState } from 'react'
+import ArrowBackIcon from '@mui/icons-material/ArrowBack'
+import Alert from '@mui/material/Alert'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import LinearProgress from '@mui/material/LinearProgress'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import Table from '@mui/material/Table'
+import TableBody from '@mui/material/TableBody'
+import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
+import TableHead from '@mui/material/TableHead'
+import TableRow from '@mui/material/TableRow'
+import Typography from '@mui/material/Typography'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router'
 import { ApiError, getItem, type Confirmation, type ItemDetail, type ItemStatus } from '../api'
 import ConfirmForm from '../components/ConfirmForm'
-import { formatDateTime, STATUS_LABELS } from '../format'
+import StatusChip from '../components/StatusChip'
+import { formatDateTime } from '../format'
 import { useIsAdmin } from '../session'
 
 // 確定できる状態。API の CONFIRMABLE_STATUSES と同じ値だが、ここではフォームを出すかどうかにだけ使う。
@@ -54,7 +69,7 @@ export default function ItemDetailPage() {
   }, [id])
 
   // 確定できたら、API が返した確定後の詳細で表示を入れ替える（読み直しのリクエストは出さない）。
-  // 状態が confirmed になるので、下の canConfirm が false になり、フォームは消える
+  // 状態が confirmed になるので、下の「確定できる状態」に当たらなくなり、フォームは消える
   function onConfirmed(detail: ItemDetail): void {
     setItem(detail)
     setPhotoMissing(false)
@@ -63,89 +78,116 @@ export default function ItemDetailPage() {
   // 出すものを、ガード節で上から順に決める
   function body() {
     if (loading) {
-      return <p>読み込み中…</p>
+      return <LinearProgress />
     }
     if (error) {
-      return <p className="error">{error}</p>
+      return <Alert severity="error">{error}</Alert>
     }
     if (item === null) {
       return null
     }
     return (
-      <>
-        <div className="detail-layout">
+      <Stack spacing={3}>
+        {/* 狭い画面では縦に、広い画面では写真と欄を横に並べる */}
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={3} sx={{ alignItems: 'flex-start' }}>
           {/* onError は、画像を読めなかったとき（S3 に写真が無い・署名付きURLの期限切れ）に呼ばれる */}
           {photoMissing ? (
-            <p className="no-photo">写真を読めませんでした（S3 に届いていないか、URL の期限が切れています）</p>
+            <Alert severity="warning" sx={{ width: { xs: '100%', sm: 320 } }}>
+              写真を読めませんでした（S3 に届いていないか、URL の期限が切れています）
+            </Alert>
           ) : (
-            <img
+            <Box
+              component="img"
               src={item.photo_url}
               alt="拾得物の写真"
-              className="photo"
               onError={() => setPhotoMissing(true)}
+              sx={{ width: { xs: '100%', sm: 320 }, borderRadius: 2, bgcolor: 'grey.100' }}
             />
           )}
 
-          <dl>
-            <dt>状態</dt>
-            <dd>{STATUS_LABELS[item.status]}</dd>
-            <dt>拾得日時</dt>
-            <dd>{formatDateTime(item.registered_at)}</dd>
-            <dt>拾得場所</dt>
-            <dd>{item.location ?? '—'}</dd>
-            <dt>保管期限</dt>
-            <dd>{item.retention_deadline ?? '（確定すると決まります）'}</dd>
-            {item.confirmed_at && (
-              <>
-                <dt>確定した日時</dt>
-                <dd>{formatDateTime(item.confirmed_at)}</dd>
-              </>
-            )}
-          </dl>
-        </div>
+          <Paper variant="outlined" sx={{ p: 2, flexGrow: 1, width: { xs: '100%', sm: 'auto' } }}>
+            <Stack spacing={1.5}>
+              <Field label="状態">
+                <StatusChip status={item.status} />
+              </Field>
+              <Field label="拾得日時">{formatDateTime(item.registered_at)}</Field>
+              <Field label="拾得場所">{item.location ?? '—'}</Field>
+              <Field label="保管期限">{item.retention_deadline ?? '（確定すると決まります）'}</Field>
+              {item.confirmed_at && <Field label="確定した日時">{formatDateTime(item.confirmed_at)}</Field>}
+            </Stack>
+          </Paper>
+        </Stack>
 
-        <h3>AI の答えと確定した値</h3>
-        <table>
-          <thead>
-            <tr>
-              <th></th>
-              <th>AI</th>
-              <th>確定</th>
-            </tr>
-          </thead>
-          <tbody>
-            {/* AI と人の値が違う行に色を付ける */}
-            {compareRows(item).map((row) => (
-              <tr key={row.key} className={row.differs ? 'differs' : undefined}>
-                <th>{row.label}</th>
-                <td>{row.ai}</td>
-                <td>{row.human}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <Box>
+          <Typography variant="h6" component="h3" sx={{ fontWeight: 700, mb: 1 }}>
+            AI の答えと確定した値
+          </Typography>
+          <TableContainer component={Paper} variant="outlined">
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell sx={{ width: 100 }} />
+                  <TableCell>AI</TableCell>
+                  <TableCell>確定</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {/* AI と人の値が違う行に色を付ける（AI の答えを上書きせずに残しているので、この差が見える） */}
+                {compareRows(item).map((row) => (
+                  <TableRow key={row.key} sx={row.differs ? { bgcolor: 'warning.light' } : undefined}>
+                    <TableCell component="th" sx={{ color: 'text.secondary' }}>
+                      {row.label}
+                    </TableCell>
+                    <TableCell>{row.ai}</TableCell>
+                    <TableCell>{row.human}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+          {item.ai_model && item.ai_analyzed_at && (
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              AI：{item.ai_model}（{formatDateTime(item.ai_analyzed_at)}）
+            </Typography>
+          )}
+        </Box>
 
-        {item.ai_error && <p className="error">解析が失敗した理由：{item.ai_error}</p>}
-        {item.ai_model && item.ai_analyzed_at && (
-          <p className="note">
-            AI：{item.ai_model}（{formatDateTime(item.ai_analyzed_at)}）
-          </p>
-        )}
+        {item.ai_error && <Alert severity="error">解析が失敗した理由：{item.ai_error}</Alert>}
 
         {/* key：別の拾得物に移ったら、フォームを作り直して入力中の値を捨てる（同じ部品が使い回されないように） */}
         {isAdmin && CONFIRMABLE_STATUSES.includes(item.status) && (
           <ConfirmForm key={item.id} itemId={item.id} initial={initialConfirmation(item)} onConfirmed={onConfirmed} />
         )}
-      </>
+      </Stack>
     )
   }
 
   return (
-    <>
-      <Link to="/items">← 一覧へ</Link>
-      <h2>拾得物の詳細</h2>
+    <Stack spacing={2}>
+      <Box>
+        <Button component={Link} to="/items" startIcon={<ArrowBackIcon />}>
+          一覧へ
+        </Button>
+      </Box>
+      <Typography variant="h5" component="h2" sx={{ fontWeight: 700 }}>
+        拾得物の詳細
+      </Typography>
       {body()}
-    </>
+    </Stack>
+  )
+}
+
+/** 詳細の欄の1行（左に項目名、右に値） */
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Stack direction="row" spacing={2} sx={{ alignItems: 'center' }}>
+      <Typography variant="body2" sx={{ color: 'text.secondary', width: 96, flexShrink: 0 }}>
+        {label}
+      </Typography>
+      <Typography variant="body1" component="div">
+        {children}
+      </Typography>
+    </Stack>
   )
 }
 

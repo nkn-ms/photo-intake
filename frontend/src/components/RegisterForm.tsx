@@ -1,4 +1,12 @@
 // 拾得物の登録。写真を選ぶ（スマホならカメラが開く）→ 縮小・EXIF の削除 → POST /items → 署名付きURLに PUT
+import PhotoCameraIcon from '@mui/icons-material/PhotoCamera'
+import Alert from '@mui/material/Alert'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
 import { useEffect, useState, type ChangeEvent, type FormEvent } from 'react'
 import { createItem, uploadPhoto } from '../api'
 import { toErrorMessage } from '../format'
@@ -80,34 +88,43 @@ export default function RegisterForm() {
   }
 
   return (
-    <form onSubmit={onSubmit}>
-      <h2>拾得物を登録する</h2>
-      <label>
-        写真
-        {/* accept="image/*"：画像だけ選べる。capture="environment"：スマホでは背面カメラが開く */}
-        <input type="file" accept="image/*" capture="environment" onChange={onFileChange} />
-      </label>
-      {photo && (
-        <>
-          <img src={photo.previewUrl} alt="送る写真" className="preview" />
-          <p>
-            {photo.beforeKB} KB → {photo.afterKB} KB（縮小し、撮影場所などの情報を消しました）
-          </p>
-        </>
-      )}
-      <label>
-        拾得場所（任意）
-        <input
-          type="text"
+    <Paper variant="outlined" sx={{ p: { xs: 2, sm: 4 } }}>
+      <Stack component="form" spacing={2} onSubmit={onSubmit}>
+        <Typography variant="h5" component="h2" sx={{ fontWeight: 700 }}>
+          拾得物を登録する
+        </Typography>
+        {/* component="label"：ボタンを押すと、中の見えない input（ファイルを選ぶ欄）が開く。
+            accept="image/*"：画像だけ選べる。capture="environment"：スマホでは背面カメラが開く */}
+        <Button variant="outlined" size="large" component="label" startIcon={<PhotoCameraIcon />}>
+          {photo ? '写真を選び直す' : '写真を撮る・選ぶ'}
+          <input type="file" accept="image/*" capture="environment" hidden onChange={onFileChange} />
+        </Button>
+        {photo && (
+          <Box>
+            <Box
+              component="img"
+              src={photo.previewUrl}
+              alt="送る写真"
+              sx={{ width: '100%', maxHeight: 280, objectFit: 'contain', borderRadius: 1, bgcolor: 'grey.100' }}
+            />
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              {photo.beforeKB} KB → {photo.afterKB} KB（縮小し、撮影場所などの情報を消しました）
+            </Typography>
+          </Box>
+        )}
+        <TextField
+          label="拾得場所（任意）"
           placeholder="例：2階 東口のベンチ"
           value={location}
           onChange={(e) => setLocation(e.target.value)}
         />
-      </label>
-      <button disabled={submitting || photo === null}>登録する</button>
-      {registeredId && <p>登録しました（解析中）。ID：{registeredId}</p>}
-      {error && <p className="error">{error}</p>}
-    </form>
+        <Button type="submit" variant="contained" size="large" disabled={photo === null} loading={submitting}>
+          登録する
+        </Button>
+        {registeredId && <Alert severity="success">登録しました（解析中）。ID：{registeredId}</Alert>}
+        {error && <Alert severity="error">{error}</Alert>}
+      </Stack>
+    </Paper>
   )
 }
 

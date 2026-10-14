@@ -1,8 +1,25 @@
 // 拾得物の一覧を出す画面。新しい順に50件を出し、状態でしぼり込める。
 // 長く analyzing のままの行には印を付ける（片付ける操作はまだ無く、見せるだけ）
+import RefreshIcon from '@mui/icons-material/Refresh'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import LinearProgress from '@mui/material/LinearProgress'
+import MenuItem from '@mui/material/MenuItem'
+import MuiLink from '@mui/material/Link'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import Table from '@mui/material/Table'
+import TableBody from '@mui/material/TableBody'
+import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
+import TableHead from '@mui/material/TableHead'
+import TableRow from '@mui/material/TableRow'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { listItems, type ItemStatus, type ItemSummary } from '../api'
+import StatusChip from '../components/StatusChip'
 import { formatDateTime, STATUS_LABELS, toErrorMessage } from '../format'
 
 // worker は失敗しても、最後の判定まで最大で約18分かかる（6分×3回）。
@@ -58,64 +75,87 @@ export default function ItemListPage() {
   // 一覧の部分に出すものを、ガード節で上から順に決める
   function body() {
     if (error) {
-      return <p className="error">{error}</p>
+      return <Alert severity="error">{error}</Alert>
     }
     if (loading) {
-      return <p>読み込み中…</p>
+      return <LinearProgress />
     }
     if (items.length === 0) {
-      return <p>該当する拾得物はありません</p>
+      return <Alert severity="info">該当する拾得物はありません</Alert>
     }
     return (
-      <table>
-        <thead>
-          <tr>
-            <th>拾得日時</th>
-            <th>状態</th>
-            {/* AI の答えと人が確定した値は混ぜずに、2列に分けて出す */}
-            <th>種別（確定）</th>
-            <th>種別（AI）</th>
-            <th>拾得場所</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => (
-            <tr key={item.id}>
-              <td>
-                <Link to={`/items/${item.id}`}>{formatDateTime(item.registered_at)}</Link>
-              </td>
-              <td>
-                {STATUS_LABELS[item.status]}
-                {isStale(item) && <span className="stale">30分以上止まっています</span>}
-              </td>
-              <td>{item.category ?? '—'}</td>
-              <td>{item.ai_category ?? '—'}</td>
-              <td>{item.location ?? '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <TableContainer component={Paper} variant="outlined">
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell>拾得日時</TableCell>
+              <TableCell>状態</TableCell>
+              {/* AI の答えと人が確定した値は混ぜずに、2列に分けて出す */}
+              <TableCell>種別（確定）</TableCell>
+              <TableCell>種別（AI）</TableCell>
+              <TableCell>拾得場所</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {items.map((item) => (
+              <TableRow key={item.id} hover>
+                <TableCell>
+                  {/* component={Link}：MUI のリンクの見た目のまま、中身を React Router のリンクにする */}
+                  <MuiLink component={Link} to={`/items/${item.id}`}>
+                    {formatDateTime(item.registered_at)}
+                  </MuiLink>
+                </TableCell>
+                <TableCell>
+                  <StatusChip status={item.status} />
+                  {isStale(item) && (
+                    <Typography variant="caption" component="div" sx={{ color: 'error.main', mt: 0.5 }}>
+                      30分以上止まっています
+                    </Typography>
+                  )}
+                </TableCell>
+                <TableCell>{item.category ?? '—'}</TableCell>
+                <TableCell>{item.ai_category ?? '—'}</TableCell>
+                <TableCell>{item.location ?? '—'}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
     )
   }
 
   return (
-    <>
-      <h2>一覧</h2>
-      <div className="toolbar">
-        <select value={status} onChange={(e) => setStatus(e.target.value as ItemStatus | '')}>
-          <option value="">すべての状態</option>
+    <Stack spacing={2}>
+      <Typography variant="h5" component="h2" sx={{ fontWeight: 700 }}>
+        一覧
+      </Typography>
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+        {/* select：TextField を選ぶ欄として使う。中の MenuItem が選択肢 */}
+        <TextField
+          select
+          size="small"
+          label="状態"
+          value={status}
+          onChange={(e) => setStatus(e.target.value as ItemStatus | '')}
+          sx={{ minWidth: 180 }}
+        >
+          <MenuItem value="">すべての状態</MenuItem>
           {/* Object.entries：{ analyzing: '解析中', … } を [['analyzing', '解析中'], …] の並びにする */}
           {Object.entries(STATUS_LABELS).map(([key, label]) => (
-            <option key={key} value={key}>
+            <MenuItem key={key} value={key}>
               {label}
-            </option>
+            </MenuItem>
           ))}
-        </select>
-        <button disabled={loading} onClick={() => setReloadCount((count) => count + 1)}>
+        </TextField>
+        <Button
+          startIcon={<RefreshIcon />}
+          disabled={loading}
+          onClick={() => setReloadCount((count) => count + 1)}
+        >
           読み直す
-        </button>
-      </div>
+        </Button>
+      </Stack>
       {body()}
-    </>
+    </Stack>
   )
 }

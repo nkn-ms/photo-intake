@@ -1,4 +1,14 @@
 // 一番外側の部品。ログインしていなければフォーム、していれば上部のメニューと、URL に応じたページを出す
+import LogoutIcon from '@mui/icons-material/Logout'
+import AppBar from '@mui/material/AppBar'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Chip from '@mui/material/Chip'
+import CircularProgress from '@mui/material/CircularProgress'
+import Container from '@mui/material/Container'
+import Toolbar from '@mui/material/Toolbar'
+import Typography from '@mui/material/Typography'
+import Alert from '@mui/material/Alert'
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router'
 import { getMe, type Me } from './api'
@@ -43,34 +53,74 @@ export default function App() {
   // 状態ごとに出すものを、ガード節で上から順に決める
   function body() {
     if (loading) {
-      return <p>読み込み中…</p>
+      return (
+        <Box sx={{ display: 'flex', justifyContent: 'center', mt: 8 }}>
+          <CircularProgress />
+        </Box>
+      )
     }
     if (me === null) {
-      return <LoginForm onLoggedIn={loadMe} />
+      return (
+        <Container maxWidth="xs" sx={{ mt: 8 }}>
+          <LoginForm onLoggedIn={loadMe} />
+        </Container>
+      )
     }
     return (
       // ここから内側のページは、useMe() でログインしている人を読める（session.ts）
       <MeContext value={me}>
-        <nav>
-          {/* NavLink：ページを読み込み直さずに URL を切り替えるリンク。end は「/ ちょうどのときだけ今のページ扱い」 */}
-          <NavLink to="/" end>
-            登録
-          </NavLink>
-          <NavLink to="/items">一覧</NavLink>
-          <span>{me.groups.join('・')}</span>
-          <button onClick={onLogOut}>ログアウト</button>
-        </nav>
-        {/* Outlet：今の URL に対応するページ（router.tsx の children）がここに出る */}
-        <Outlet />
+        <Container maxWidth="md" sx={{ py: 3 }}>
+          <Outlet />
+        </Container>
       </MeContext>
     )
   }
 
   return (
     <>
-      <h1>photo-intake</h1>
+      <AppBar position="sticky" elevation={0}>
+        <Toolbar sx={{ gap: 1 }}>
+          <Typography variant="h6" component="h1" sx={{ fontWeight: 700, mr: 2 }}>
+            photo-intake
+          </Typography>
+          {me && (
+            <>
+              {/* component={NavLink}：MUI のボタンの見た目のまま、中身を React Router のリンクにする。
+                  NavLink は今のページのリンクに .active を付けるので、それを太字にする */}
+              <Button color="inherit" component={NavLink} to="/" end sx={navSx}>
+                登録
+              </Button>
+              <Button color="inherit" component={NavLink} to="/items" sx={navSx}>
+                一覧
+              </Button>
+              <Box sx={{ flexGrow: 1 }} />
+              {me.groups.map((group) => (
+                <Chip
+                  key={group}
+                  label={group}
+                  size="small"
+                  sx={{ color: 'inherit', borderColor: 'rgba(255,255,255,0.6)' }}
+                  variant="outlined"
+                />
+              ))}
+              <Button color="inherit" startIcon={<LogoutIcon />} onClick={onLogOut}>
+                ログアウト
+              </Button>
+            </>
+          )}
+        </Toolbar>
+      </AppBar>
       {body()}
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <Container maxWidth="sm">
+          <Alert severity="error">{error}</Alert>
+        </Container>
+      )}
     </>
   )
+}
+
+// メニューのボタンの見た目。今のページ（.active）だけ下線を付ける
+const navSx = {
+  '&.active': { textDecoration: 'underline', textUnderlineOffset: '6px', fontWeight: 700 },
 }

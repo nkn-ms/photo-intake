@@ -1,6 +1,12 @@
 // 拾得物の内容を確定するフォーム。詳細ページが、admin のときだけ出す。
 // 最初は AI の答えを入れておき、人が写真と見比べて直してから確定する。
 // フォームを隠すのは画面の都合にすぎず、本当に止めるのは API（admin でなければ 403、確定できない状態なら 409）
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
 import { useState, type FormEvent } from 'react'
 import { confirmItem, type Confirmation, type ItemDetail } from '../api'
 import { toErrorMessage } from '../format'
@@ -42,32 +48,38 @@ export default function ConfirmForm({ itemId, initial, onConfirmed }: Props) {
   }
 
   return (
-    <form onSubmit={onSubmit}>
-      <h3>内容を確定する</h3>
-      <label>
-        種別（必須）
-        <input type="text" required value={category} onChange={(e) => setCategory(e.target.value)} />
-      </label>
-      <label>
-        色
-        <input type="text" value={color} onChange={(e) => setColor(e.target.value)} />
-      </label>
-      <label>
-        ブランド
-        <input
-          type="text"
-          placeholder="分からなければ空のまま"
-          value={brand}
-          onChange={(e) => setBrand(e.target.value)}
+    <Paper variant="outlined" sx={{ p: { xs: 2, sm: 3 } }}>
+      <Stack component="form" spacing={2} onSubmit={onSubmit}>
+        <Typography variant="h6" component="h3" sx={{ fontWeight: 700 }}>
+          内容を確定する
+        </Typography>
+        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+          AI の答えを入れてあります。写真と見比べて、直してから確定してください。
+        </Typography>
+        <TextField label="種別" required value={category} onChange={(e) => setCategory(e.target.value)} />
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+          <TextField label="色" fullWidth value={color} onChange={(e) => setColor(e.target.value)} />
+          <TextField
+            label="ブランド"
+            fullWidth
+            placeholder="分からなければ空のまま"
+            value={brand}
+            onChange={(e) => setBrand(e.target.value)}
+          />
+        </Stack>
+        <TextField
+          label="特徴（1行に1つ）"
+          multiline
+          minRows={3}
+          value={features}
+          onChange={(e) => setFeatures(e.target.value)}
         />
-      </label>
-      <label>
-        特徴（1行に1つ）
-        <textarea rows={4} value={features} onChange={(e) => setFeatures(e.target.value)} />
-      </label>
-      <button disabled={submitting}>確定する</button>
-      {error && <p className="error">{error}</p>}
-    </form>
+        <Button type="submit" variant="contained" loading={submitting} sx={{ alignSelf: 'flex-start' }}>
+          確定する
+        </Button>
+        {error && <Alert severity="error">{error}</Alert>}
+      </Stack>
+    </Paper>
   )
 }
 

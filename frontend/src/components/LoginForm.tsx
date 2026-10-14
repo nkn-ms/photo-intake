@@ -1,4 +1,10 @@
 // ログインのフォーム。ログインできたら、親（App）から受け取った onLoggedIn を呼ぶ
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
 import { useState, type FormEvent } from 'react'
 import { logIn } from '../auth'
 
@@ -23,30 +29,34 @@ export default function LoginForm({ onLoggedIn }: { onLoggedIn: () => void }) {
   }
 
   return (
-    <form onSubmit={onSubmit}>
-      <label>
-        メールアドレス
-        <input
+    <Paper variant="outlined" sx={{ p: 4 }}>
+      <Stack component="form" spacing={2} onSubmit={onSubmit}>
+        <Typography variant="h5" component="h2" sx={{ fontWeight: 700 }}>
+          ログイン
+        </Typography>
+        <TextField
+          label="メールアドレス"
           type="email"
           autoComplete="username"
           required
           value={email}
           onChange={(e) => setEmail(e.target.value)}
         />
-      </label>
-      <label>
-        パスワード
-        <input
+        <TextField
+          label="パスワード"
           type="password"
           autoComplete="current-password"
           required
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
-      </label>
-      <button disabled={submitting}>ログイン</button>
-      {error && <p className="error">{error}</p>}
-    </form>
+        {/* loading：true の間は押せなくなり、くるくる回る印が出る（MUI v7 から Button に入った機能） */}
+        <Button type="submit" variant="contained" size="large" loading={submitting}>
+          ログイン
+        </Button>
+        {error && <Alert severity="error">{error}</Alert>}
+      </Stack>
+    </Paper>
   )
 }
 
