@@ -1,31 +1,84 @@
 # photo-intake
 
-**画像をアップロードすると、非同期で AI が内容を構造化して台帳にし、
-自由文から意味検索で照合できるサーバーレス基盤。**
+**拾得物（落とし物）を写真で登録すると、AI が種別・色・ブランド・特徴を読み取って台帳にする、サーバーレスの管理システム。**
 
-AWS 上のインフラはすべて Terraform で構築する。
+AWS のインフラはすべて Terraform で作っている。
 
-想定する使い方は「物品の登録と照合」。在庫・備品の棚卸し、中古品の出品と探索、
-拾得物の管理など、**「写真で登録して、言葉で探す」業務に共通して使える形**にしている。
+- 画面：<https://photo-intake.nkn-ms.workers.dev>（ログインが要る。アカウントは配っていない）
+- 構成図：<https://photo-intake.nkn-ms.workers.dev/architecture>（ログインなしで見られる）
 
-> 🚧 **開発中。** 現在は S3 バケットと SQS キューまで。1つずつ追加していく。
+## 動くもの
 
-## 目指す構成
+1. **スタッフが写真を撮って登録する。** 写真はブラウザの中で縮小し、撮影場所などの情報（EXIF）を消してから、
+   署名付きURL（期限付きで S3 に置く許可）で **S3 に直接置く**。写真は API を通らない
+2. **AI が写真を読む。** S3 → SQS → Lambda（worker）が Claude に写真を渡し、`{種別・色・ブランド・特徴}` を JSON で受け取って
+   Aurora に保存する。状態は「確認待ち」
+3. **一覧と詳細で確かめる。** 詳細では AI の答えと人が確定した値を並べ、違う項目に色を付ける
+4. **admin が確定する。** 状態が「確定」になり、保管期限（拾得日 + 3か月。遺失物法の保管期間）が自動で入る
+5. **失敗しても業務は止まらない。** 解析が3回失敗したら DLQ に移り、アラームがメールで知らせる。
+   その行は「解析失敗」になり、画面から人が手で入力して確定できる
 
+まだ作っていないもの（落とし主の問い合わせとのベクトル検索、LINE、CI）は [まだやっていないこと](#まだやっていないこと) に書いた。
+
+## 構成
+
+```mermaid
+%% 構成図（今動いている形）。Mermaid という、図を文字で書く記法で書いている。
+%% 画面の「構成」ページ（ArchitecturePage）がこのファイルを読んで図にする。
+%% README.md の構成図にも同じ文字を貼っている（GitHub は mermaid のコードブロックを図にして見せる）。直すときは両方を直す。
+flowchart LR
+  user["スマホ / PC<br>（ブラウザ）"]
+
+  subgraph cloudflare["Cloudflare"]
+    web["Workers（静的ファイル）<br>React + Vite の SPA"]
+  end
+
+  subgraph aws["AWS（東京リージョン）・すべて Terraform で作る"]
+    cognito["Cognito<br>ログイン・グループ（staff / admin）"]
+    apigw["API Gateway（HTTP API）<br>JWT オーソライザー"]
+    api["Lambda: api<br>FastAPI + Mangum"]
+    s3["S3: uploads<br>写真"]
+    sqs["SQS"]
+    dlq["DLQ"]
+    alarm["CloudWatch Alarm → SNS<br>メールで知らせる"]
+    worker["Lambda: worker<br>@idempotent"]
+    ddb["DynamoDB<br>二重実行を止める記録"]
+    secret["Secrets Manager<br>Claude の API キー"]
+    subgraph vpc["VPC（IGW・NAT Gateway なし）"]
+      aurora[("Aurora Serverless v2<br>PostgreSQL")]
+    end
+  end
+
+  subgraph anthropic["Anthropic"]
+    claude["Claude API<br>Haiku 5.5"]
+  end
+
+  user -- "画面を読む" --> web
+  user -- "ログイン" --> cognito
+  user -- "API（トークン付き）" --> apigw --> api
+  api -- "Data API（HTTPS で SQL）" --> aurora
+  user -- "署名付きURL で写真を直接 PUT" --> s3
+  s3 -- "置かれたら通知" --> sqs --> worker
+  sqs -- "3回失敗" --> dlq --> alarm
+  worker --> ddb
+  worker --> secret
+  worker -- "写真 → 種別・色・ブランド・特徴" --> claude
+  worker -- "Data API" --> aurora
 ```
-スマホ / PC
-  └→ CloudFront + S3（React + Vite / SPA）
-       └→ Cognito で認証
-       └→ API Gateway (HTTP API) → Lambda (FastAPI + Mangum)
-              ├→ 署名付きURL の発行
-              └→ Aurora Serverless v2 (PostgreSQL + pgvector) ※Data API
-  └→ S3 に直接 PUT
-       └→ S3 Event → SQS → Lambda (worker)
-              ├→ Bedrock : 画像 → 構造化JSON + 埋め込み
-              ├→ Aurora に保存
-              └→ LINE で通知
-       └→ 失敗3回 → DLQ → CloudWatch Alarm → SNS
-```
+
+> 画面の `/architecture` も同じ図を出す（`frontend/src/architecture.mmd` を README と画面の両方で使っている）。
+
+| 層 | 使っているもの |
+|---|---|
+| 画面 | React 19 + Vite + TypeScript、MUI、React Router |
+| 画面の置き場所 | Cloudflare Workers（本来は CloudFront + S3。[理由](#今は代わりのものを使っているところ)） |
+| 認証 | Cognito（グループ：staff / admin）、API Gateway の JWT オーソライザー |
+| API | API Gateway（HTTP API）→ Lambda（Python 3.12・FastAPI + Mangum・Pydantic v2） |
+| DB | Aurora Serverless v2（PostgreSQL）を Data API で使う。使われないときは自動で止まる |
+| 非同期 | S3 イベント → SQS（+ DLQ）→ Lambda（worker）。二重実行は Powertools の `@idempotent` + DynamoDB で止める |
+| AI | Claude API（Haiku 5.5）を直接呼ぶ（本来は Bedrock。[理由](#今は代わりのものを使っているところ)） |
+| IaC | Terraform |
+| テスト | pytest + moto（AWS に繋がずに動く）、mypy（strict）、ruff、Oxlint |
 
 ## 設計判断
 
