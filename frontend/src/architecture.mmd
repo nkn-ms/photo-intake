@@ -1,0 +1,41 @@
+%% 構成図（今動いている形）。Mermaid という、図を文字で書く記法で書いている。
+%% 画面の「構成」ページ（ArchitecturePage）がこのファイルを読んで図にする。
+%% README.md の構成図にも同じ文字を貼っている（GitHub は mermaid のコードブロックを図にして見せる）。直すときは両方を直す。
+flowchart LR
+  user["スマホ / PC<br>（ブラウザ）"]
+
+  subgraph cloudflare["Cloudflare"]
+    web["Workers（静的ファイル）<br>React + Vite の SPA"]
+  end
+
+  subgraph aws["AWS（東京リージョン）・すべて Terraform で作る"]
+    cognito["Cognito<br>ログイン・グループ（staff / admin）"]
+    apigw["API Gateway（HTTP API）<br>JWT オーソライザー"]
+    api["Lambda: api<br>FastAPI + Mangum"]
+    s3["S3: uploads<br>写真"]
+    sqs["SQS"]
+    dlq["DLQ"]
+    alarm["CloudWatch Alarm → SNS<br>メールで知らせる"]
+    worker["Lambda: worker<br>@idempotent"]
+    ddb["DynamoDB<br>二重実行を止める記録"]
+    secret["Secrets Manager<br>Claude の API キー"]
+    subgraph vpc["VPC（IGW・NAT Gateway なし）"]
+      aurora[("Aurora Serverless v2<br>PostgreSQL")]
+    end
+  end
+
+  subgraph anthropic["Anthropic"]
+    claude["Claude API<br>Haiku 5.5"]
+  end
+
+  user -- "画面を読む" --> web
+  user -- "ログイン" --> cognito
+  user -- "API（トークン付き）" --> apigw --> api
+  api -- "Data API（HTTPS で SQL）" --> aurora
+  user -- "署名付きURL で写真を直接 PUT" --> s3
+  s3 -- "置かれたら通知" --> sqs --> worker
+  sqs -- "3回失敗" --> dlq --> alarm
+  worker --> ddb
+  worker --> secret
+  worker -- "写真 → 種別・色・ブランド・特徴" --> claude
+  worker -- "Data API" --> aurora
