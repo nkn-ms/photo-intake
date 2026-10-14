@@ -123,10 +123,13 @@ export default function ItemDetailPage() {
             AI の答えと確定した値
           </Typography>
           <TableContainer component={Paper} variant="outlined">
-            <Table size="small">
+            {/* tableLayout: 'fixed'：列の幅を中身の長さで決めず、ここで指定した幅にする。
+                指定しないと、AI の特徴のような長い文字の列が幅を取り、「確定」の見出しが縦に折り返す */}
+            <Table size="small" sx={{ tableLayout: 'fixed' }}>
               <TableHead>
                 <TableRow>
                   <TableCell sx={{ width: 100 }} />
+                  {/* 幅を指定しない列は、残りの幅を等分する。項目名の列を除いた残りを、AI と確定で半分ずつ分ける */}
                   <TableCell>AI</TableCell>
                   <TableCell>確定</TableCell>
                 </TableRow>
