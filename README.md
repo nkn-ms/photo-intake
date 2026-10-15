@@ -7,7 +7,7 @@ AWS のインフラはすべて Terraform で作っている。
 - 画面：<https://photo-intake.nkn-ms.workers.dev>（ログインが要る。アカウントは配っていない）
 - 構成図：<https://photo-intake.nkn-ms.workers.dev/architecture>（ログインなしで見られる）
 
-## 動くもの
+## 処理の流れ
 
 1. **スタッフが写真を撮って登録する。** 写真はブラウザの中で縮小し、撮影場所などの情報（EXIF）を消してから、
    署名付きURL（期限付きで S3 に置く許可）で **S3 に直接置く**。写真は API を通らない
