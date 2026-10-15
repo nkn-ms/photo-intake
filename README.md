@@ -11,12 +11,12 @@ AWS のインフラはすべて Terraform で作っている。
 
 1. **スタッフが写真を撮って登録する。** 写真はブラウザの中で縮小し、撮影場所などの情報（EXIF）を消してから、
    署名付きURL（期限付きで S3 に置く許可）で **S3 に直接置く**。写真は API を通らない
-2. **AI が写真を読む。** S3 → SQS → Lambda（worker）が Claude に写真を渡し、`{種別・色・ブランド・特徴}` を JSON で受け取って
-   Aurora に保存する。状態は「確認待ち」
+2. **AI が写真を読む。** 写真が S3 に置かれると、SQS を通して Lambda（worker）が起動する。worker は写真を Claude に渡し、
+   `{種別・色・ブランド・特徴}` を JSON で受け取って Aurora に保存する。状態は「確認待ち」
 3. **一覧と詳細で確かめる。** 詳細では AI の答えと人が確定した値を並べ、違う項目に色を付ける
-4. **admin が確定する。** 状態が「確定」になり、保管期限（拾得日 + 3か月。遺失物法の保管期間）が自動で入る
-5. **失敗しても業務は止まらない。** 解析が3回失敗したら DLQ に移り、アラームがメールで知らせる。
-   その行は「解析失敗」になり、画面から人が手で入力して確定できる
+4. **admin が確定する。** 状態が「確定」になり、保管期限（拾得日 + 3か月）が自動で入る
+5. **失敗しても業務は止まらない。** 解析が失敗した行は「解析失敗」になり、画面から人が手で入力して確定できる。
+   一時的な失敗は3回までやり直し、それでも駄目ならアラームがメールで知らせる（[詳しく](#失敗したらどうなるか)）
 
 まだ作っていないもの（落とし主の問い合わせとのベクトル検索、LINE、CI）は [まだやっていないこと](#まだやっていないこと) に書いた。
 
@@ -41,7 +41,7 @@ flowchart LR
     sqs["SQS"]
     dlq["DLQ"]
     alarm["CloudWatch Alarm → SNS<br>メールで知らせる"]
-    worker["Lambda: worker<br>@idempotent"]
+    worker["Lambda: worker<br>@idempotent_function"]
     ddb["DynamoDB<br>二重実行を止める記録"]
     secret["Secrets Manager<br>Claude の API キー"]
     subgraph vpc["VPC（IGW・NAT Gateway なし）"]
@@ -59,6 +59,7 @@ flowchart LR
   api -- "Data API（HTTPS で SQL）" --> aurora
   user -- "署名付きURL で写真を直接 PUT" --> s3
   s3 -- "置かれたら通知" --> sqs --> worker
+  worker -- "写真を読む" --> s3
   sqs -- "3回失敗" --> dlq --> alarm
   worker --> ddb
   worker --> secret
@@ -75,7 +76,7 @@ flowchart LR
 | 認証 | Cognito（グループ：staff / admin）、API Gateway の JWT オーソライザー |
 | API | API Gateway（HTTP API）→ Lambda（Python 3.12・FastAPI + Mangum・Pydantic v2） |
 | DB | Aurora Serverless v2（PostgreSQL）を Data API で使う。使われないときは自動で止まる |
-| 非同期 | S3 イベント → SQS（+ DLQ）→ Lambda（worker）。二重実行は Powertools の `@idempotent` + DynamoDB で止める |
+| 非同期 | S3 イベント → SQS（+ DLQ）→ Lambda（worker）。二重実行は Powertools の `@idempotent_function` + DynamoDB で止める |
 | AI | Claude API（Haiku 5.5）を直接呼ぶ（本来は Bedrock。[理由](#今は代わりのものを使っているところ)） |
 | IaC | Terraform |
 | テスト | pytest + moto（AWS に繋がずに動く）、mypy（strict）、ruff、Oxlint |
@@ -83,14 +84,16 @@ flowchart LR
 ## 設計判断
 
 ### なぜ SQS を挟むのか
-画像の AI 解析には数秒かかる。同期処理ではアップロード API がタイムアウトするか、
-クライアントを待たせることになる。**アップロード完了の応答だけ即座に返し、解析は後ろで回す。**
+画像の AI 解析には数秒かかる。登録の API の中で解析までやると、その間スタッフを待たせることになり、
+AI が混んで遅れれば API Gateway の上限（約30秒）でタイムアウトする。
+**登録の API は署名付きURL を返してすぐ終わり、解析は写真が S3 に置かれてから後ろで回す。**
 この分離がこの構成の中心にある。
 
 
 ### なぜ Aurora Serverless v2 + Data API なのか
-登録された物品と照会の突合が本質的な要件で、条件の組み合わせで絞り込むためアクセスパターンが
-固定できない。よって RDB を選んだ。さらに `pgvector` でベクトル類似検索まで同じ DB で賄える。
+本題は、拾得物と落とし主の問い合わせを照らし合わせること（これから作る）。種別・色・場所・日付などの
+組み合わせで絞り込むので、読み方（アクセスパターン）を前もって決めきれない。よって RDB を選んだ。
+PostgreSQL なら、照合に使うベクトル類似検索も `pgvector` で同じ DB に足せる（これも、これから作る）。
 
 通常 RDB を使うと連鎖でコストが増える。
 
@@ -111,9 +114,14 @@ VPC は Aurora の置き場として作るが、IGW も NAT も置いていな�
 
 
 ### 失敗したらどうなるか
-SQS が3回リトライし、それでも失敗したメッセージは DLQ に退避する。
-DLQ にメッセージが入ると CloudWatch Alarm が SNS 経由で通知する。
-該当レコードは `analysis_failed` 状態になり、管理画面から手動入力に回せる。**業務は止まらない。**
+失敗を、やり直して意味があるかどうかで2種類に分けている。
+
+- **やり直しても結果が変わらない失敗**（対応していない画像の形式、AI の答えが JSON として読めない、AI が受け付けない画像、など）：
+  その場で `analysis_failed` にして終える。やり直さず、DLQ にも入れない
+- **一時的な失敗**（AI の混雑、通信の失敗、DB の起動待ち、など）：SQS が3回まで配り直す。
+  3回目も失敗したら `analysis_failed` を書いてから DLQ に移す。DLQ にメッセージが入ると CloudWatch Alarm が SNS 経由でメールを送る
+
+どちらの場合も行は `analysis_failed` になり、管理画面から手で入力して確定できる。**業務は止まらない。**
 
 
 ### AI の出力を上書きしない
@@ -124,7 +132,7 @@ DLQ にメッセージが入ると CloudWatch Alarm が SNS 経由で通知す�
 
 ### 冪等性
 SQS は at-least-once 配信なので、同じメッセージが複数回届きうる。
-AWS Lambda Powertools の `@idempotent` が DynamoDB に実行済みキーを記録し、二重実行を防ぐ。
+AWS Lambda Powertools の `@idempotent_function` が DynamoDB に実行済みキーを記録し、二重実行を防ぐ。
 
 
 ### DB の起動待ちは画面がする
@@ -143,12 +151,13 @@ Aurora は最後の SQL から5分で止まる設定にしている（`min_capac
 > 途中まで Vue 3 で作り、React に戻した。Vue 版は `frontend-vue/` に参考として残している（ビルド・公開はしない）。
 
 ### 今は代わりのものを使っているところ
-AWS アカウントの確認が済むまで、2か所を AWS の外のサービスで代わりにしている。**どちらも Terraform の変数1つで元に戻せる。**
+AWS アカウントの制限で使えなかった間、2か所を AWS の外のサービスで代わりにしている。
+本来の形のコードも Terraform も残してあり、切り替えは変数で選ぶ。
 
 | | 本来 | 今 | 代わりにしている理由 | 元に戻す方法 |
 |---|---|---|---|---|
-| 画面の置き場所 | CloudFront + S3（OAC で S3 は非公開のまま） | Cloudflare Workers（静的ファイル） | アカウントの確認が済むまで CloudFront を作れない | `enable_cloudfront = true` で `make apply` し、ビルドした画面を S3 に置く（Terraform は書いてある） |
-| AI | Bedrock（Claude） | Claude API（Anthropic）を直接 | アカウント全体で Bedrock が止められている（サポートに問い合わせ中） | `analyzer = "bedrock"` |
+| 画面の置き場所 | CloudFront + S3（OAC で S3 は非公開のまま） | Cloudflare Workers（静的ファイル） | アカウントの確認が済むまで CloudFront を作れなかった（2026-10-15 に解除され、distribution は作成済み） | ビルドした画面を S3 に置く（そのための make のコマンドはまだ無い）。CORS の許可先には、CloudFront の URL を Terraform が自動で足す |
+| AI | Bedrock | Claude API（Anthropic）を直接 | アカウント全体で Bedrock が止められている（サポートに問い合わせ中） | `analyzer = "bedrock"`。既定のモデルは Amazon Nova 2 Lite。Claude にするには `vision_model_id` を替え、Anthropic のモデルの利用申請も要る（Haiku 5.5 なら、Bedrock 側の呼び方も temperature を送らない形に直す） |
 
 **本番では Bedrock にする。** Claude API を直接呼ぶと、写真が AWS の外（Anthropic）に出る。
 Bedrock なら AWS の中で済み、IAM のロールで呼べるので、API キーを持つ必要も無くなる。
@@ -201,6 +210,13 @@ Terraform の state は**今はローカル**（`infra/envs/dev/terraform.tfstat
 
 ## 使い方
 
+用意するもの：
+
+- Terraform 1.11 以上
+- AWS CLI v2。IAM Identity Center のプロファイルを `aws configure sso` で `photo-intake` という名前で作っておく（Makefile がこの名前を使う）
+- uv（Python の実行と依存の管理）、Node.js
+- Cloudflare に公開するなら、`cd frontend && npx wrangler login`
+
 初めて作るとき：
 
 ```bash
@@ -219,6 +235,10 @@ make web-env                                  # 画面が使う値を frontend/.
 cd frontend && npm install && npm run dev     # http://localhost:5173
 make deploy-web                               # 画面を Cloudflare Workers に公開する
 ```
+
+- `make apply` の後、アラームの宛先に SNS から確認のメールが届く。中のリンクを押すまで、アラームのメールは届かない
+- CORS で許す画面のドメインは、`infra/envs/dev/main.tf` の `web_origins` に直接書いている（作者の `*.workers.dev`）。
+  別の場所に画面を公開するなら、ここを書き換える
 
 ふだん使うもの：
 
@@ -262,6 +282,6 @@ docs/
   解析が終わったら、落とし物の知らせ用の LINE グループに「休憩室に鍵の忘れ物がありました」のように届ける。
   落とし主への知らせは優先度を下げている
 - **CI：** GitHub Actions + OIDC（キーを持たない）。PR に `terraform plan` の結果を出し、merge で apply。その前に state を S3 に移す
-- **本来の形に戻す：** CloudFront（`enable_cloudfront`）と Bedrock（`analyzer = "bedrock"`）。AWS アカウントの確認が済んだら
-- **保管期限が過ぎた後：** 警察への届出・処分の状態と画面
+- **本来の形に戻す：** 画面を CloudFront で配る（distribution は作成済み。画面を S3 に置く手順が残り）。
+  Bedrock（`analyzer = "bedrock"`）は、アカウントの制限が解けたら
 - **CSP**（上のセキュリティの節）

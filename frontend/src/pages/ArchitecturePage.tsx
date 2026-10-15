@@ -92,8 +92,9 @@ export default function ArchitecturePage() {
           <b>写真は API を通らない。</b>API は署名付きURL（期限付きで S3 に置く許可）を返すだけで、ブラウザが S3 に直接置く
         </li>
         <li>
-          <b>解析は非同期。</b>S3 → SQS → worker。worker が3回失敗したら DLQ に移り、アラームがメールで知らせる。
-          SQS は同じ通知を2回届けることがあるので、worker は DynamoDB の記録で二重実行を止める（@idempotent）
+          <b>解析は非同期。</b>S3 → SQS → worker。一時的な失敗は3回までやり直し、それでも駄目なら DLQ
+          に移り、アラームがメールで知らせる。やり直しても変わらない失敗（読めない形式など）は、その場で「解析失敗」にする。
+          SQS は同じ通知を2回届けることがあるので、worker は DynamoDB の記録で二重実行を止める（@idempotent_function）
         </li>
         <li>
           <b>AI の答えを上書きしない。</b>AI の答えと人が確定した値を別の列に持つ。後から AI の正しさを測れる
@@ -102,11 +103,11 @@ export default function ArchitecturePage() {
 
       <Section title="今は代わりのものを使っているところ">
         <li>
-          <b>画面の置き場所：Cloudflare Workers。</b>本来は CloudFront + S3（Terraform は書いてあり、enable_cloudfront
-          で切り替える）。AWS アカウントの確認が済むまでの代わり
+          <b>画面の置き場所：Cloudflare Workers。</b>本来は CloudFront + S3。AWS アカウントの確認が済むまで CloudFront
+          を作れなかったための代わり（確認は済み、CloudFront は作成済み。画面を S3 に置けば切り替えられる）
         </li>
         <li>
-          <b>AI：Claude API（Anthropic）を直接。</b>本来は Bedrock（コードは analyzer = bedrock で切り替える）。写真が AWS
+          <b>AI：Claude API（Anthropic）を直接。</b>本来は Bedrock（コードは analyzer = bedrock で切り替える。Bedrock はアカウントの制限が解けるのを待っている）。写真が AWS
           の外に出るので、本番では Bedrock にする
         </li>
       </Section>
