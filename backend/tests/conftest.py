@@ -38,6 +38,8 @@ os.environ["VISION_MODEL_ID"] = "jp.amazon.nova-2-lite-v1:0"
 os.environ["MAX_RECEIVE_COUNT"] = "3"
 # Bedrock は moto で偽物にできないので、本物を呼ばない側にしておく。答えはテストごとに差し替える
 os.environ["ANALYZER"] = "dummy"
+# LINE の受け口（line/webhook.py）が読む。鍵の値はテストの中で差し替えるので、場所は偽物でよい
+os.environ["LINE_CHANNEL_SECRET_ARN"] = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:line"
 
 
 # --- 2. moto（偽の AWS）---

@@ -36,9 +36,9 @@ dev = [
 default-groups = ["dev", "api"]
 
 [tool.pytest.ini_options]
-# テストから import handler で worker/handler.py を、import app で api/app.py を読めるようにする。
+# テストから import handler で worker/handler.py を、import app で api/app.py を、import webhook で line/webhook.py を読めるようにする。
 # Lambda でも zip の一番上に handler.py（app.py）が置かれ、import handler（import app）として読まれるので、それに合わせている。
-pythonpath = ["worker", "api"]
+pythonpath = ["worker", "api", "line"]
 testpaths = ["tests"]
 
 [tool.mypy]
@@ -46,10 +46,10 @@ python_version = "3.12"
 strict = true
 # uv run mypy だけで検査できるように、対象を書いておく。
 # tests/ は入れない（偽物の関数や monkeypatch に型を付けても、得られるものが少ない）
-files = ["worker", "api"]
+files = ["worker", "api", "line"]
 
 [tool.ruff]
 line-length = 100
 # 自分のコードの置き場所。ここにある auth・db・routers などを「自分のコード」として、
 # import の並びで外部ライブラリ（fastapi など）の後ろに分けて置く
-src = ["api", "worker"]
+src = ["api", "worker", "line"]
