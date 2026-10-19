@@ -31,14 +31,24 @@ class FakeWorld:
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, str]] = []  # LINE に送ったリクエスト（メソッド, URL）
+        self.replies: list[dict] = []  # LINE に送った返事の本文
+        self.reply_status = (
+            200  # 返事を送ったときに LINE が返す番号（トークン切れを試すときに変える）
+        )
         self.sql: list[list[Any]] = []  # DB に送った SQL のパラメーター
         self.puts: list[tuple[str, bytes, str]] = []  # S3 に置いたもの（キー, 中身, 形式）
         self.members = {MEMBER}  # 落とし物グループのメンバー
         self.photo = FakeResponse(b"jpeg-bytes", "image/jpeg")  # LINE から取ってくる写真
         self.member_api_status = 200  # メンバーのときに LINE が返す番号（不調を試すときに変える）
 
-    def line_request(self, method: str, url: str) -> FakeResponse:
+    def line_request(self, method: str, url: str, body: dict | None = None) -> FakeResponse:
         self.requests.append((method, url))
+        if url.endswith("/message/reply"):
+            self.replies.append(body or {})
+            if self.reply_status != 200:
+                raise urllib.error.HTTPError(
+                    url, self.reply_status, "error", Message(), io.BytesIO(b"{}")
+                )
         if "/member/" in url:
             user_id = url.rsplit("/", 1)[1]
             status = self.member_api_status if user_id in self.members else 404
@@ -77,6 +87,7 @@ def photo_event(user_id: str = MEMBER, source_type: str = "user") -> dict:
         "timestamp": 1760000000000,  # 2025-10-09T08:53:20Z
         "source": source,
         "message": {"type": "image", "id": "5800000000001", "contentProvider": {"type": "line"}},
+        "replyToken": "reply-token-1",
     }
 
 
@@ -98,12 +109,27 @@ def test_メンバーの写真は行を作ってS3に置く(world: FakeWorld) ->
         ]
     ]
     assert world.puts == [("uploads/line-5800000000001.jpg", b"jpeg-bytes", "image/jpeg")]
+    assert world.replies == [
+        {
+            "replyToken": "reply-token-1",
+            "messages": [{"type": "text", "text": intake.RECEIVED_MESSAGE}],
+        }
+    ]
+
+
+def test_返事に失敗しても登録は続ける(world: FakeWorld) -> None:
+    # DB の起動待ちでやり直した2回目は、返事のトークンが使用済みなので LINE が 400 を返す
+    world.reply_status = 400
+    intake.handler(photo_event(), None)
+    assert len(world.sql) == 1
+    assert len(world.puts) == 1
 
 
 def test_メンバーでなければ何もしない(world: FakeWorld) -> None:
     intake.handler(photo_event(user_id="U" + "9" * 32), None)
     assert world.sql == []
     assert world.puts == []
+    assert world.replies == []
 
 
 def test_落とし物グループが決まっていなければLINEに聞かずに何もしない(
@@ -133,11 +159,12 @@ def test_読めない形式の写真は登録しない(world: FakeWorld) -> None
     intake.handler(photo_event(), None)
     assert world.sql == []
     assert world.puts == []
+    assert world.replies == []
 
 
 def test_写真の取得より先に行を作らない(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
     # 写真を取ってこられなかったら、写真の無い行を残さない
-    def broken_line_request(method: str, url: str) -> FakeResponse:
+    def broken_line_request(method: str, url: str, body: dict | None = None) -> FakeResponse:
         if url.endswith("/content"):
             raise urllib.error.URLError("timeout")
         return FakeResponse()

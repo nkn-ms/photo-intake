@@ -6,7 +6,7 @@ line-webhook（webhook.py）が署名を確かめたあと、LINE のイベン�
                                    落とし物グループが決まった後なら、それ以外のグループからは退出する
                                    （ボットが落とし物グループにしか入っていない状態を保つため）
   ・1対1のトークで写真が届いた   … 送り主が落とし物グループのメンバーか確かめる → 写真を LINE から取ってくる →
-                                   items に行を作る → S3 の uploads/ に置く
+                                   「受け付けました」と返事する → items に行を作る → S3 の uploads/ に置く
                                    （ここから先は、画面から登録したときと同じ S3 → SQS → worker）
   ・それ以外                       … 何もしない
 
@@ -22,6 +22,7 @@ LINE の API は、worker が Claude を呼ぶのと同じく、Python の標準
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import time
@@ -84,6 +85,7 @@ def handler(event: dict[str, Any], context: object) -> None:
             message_id=event["message"]["id"],
             user_id=source["userId"],
             sent_at_ms=event["timestamp"],
+            reply_token=event["replyToken"],
         )
     else:
         logger.info("ignored: type=%s source=%s", event.get("type"), source.get("type"))
@@ -108,7 +110,7 @@ def on_join(group_id: str) -> None:
         logger.info("left group (not the lost-and-found group): %s", group_id)
 
 
-def register_photo(message_id: str, user_id: str, sent_at_ms: int) -> None:
+def register_photo(message_id: str, user_id: str, sent_at_ms: int, reply_token: str) -> None:
     """1対1のトークで届いた写真を、拾得物として登録する。"""
     if not is_group_member(user_id):  # 1. 落とし物グループのメンバーか
         logger.info("ignored photo from non-member: %s", user_id)
@@ -122,10 +124,12 @@ def register_photo(message_id: str, user_id: str, sent_at_ms: int) -> None:
         )
         return
 
-    # 3. 置き場所を決める。メッセージ ID から決めるので、やり直しても同じキーになる
+    reply(reply_token, RECEIVED_MESSAGE)  # 3. 送った人に「受け付けました」と返事する
+
+    # 4. 置き場所を決める。メッセージ ID から決めるので、やり直しても同じキーになる
     s3_key = f"uploads/line-{message_id}{extension}"
-    insert_item(s3_key, f"line:{user_id}", sent_at_ms)  # 4. items に行を作る（status は analyzing）
-    put_photo(s3_key, image, content_type)  # 5. S3 に置く → ここから先は worker
+    insert_item(s3_key, f"line:{user_id}", sent_at_ms)  # 5. items に行を作る（status は analyzing）
+    put_photo(s3_key, image, content_type)  # 6. S3 に置く → ここから先は worker
     logger.info("registered photo: %s from %s", s3_key, user_id)
 
 
@@ -175,18 +179,44 @@ def fetch_photo(message_id: str) -> tuple[bytes, str]:
     return image, content_type
 
 
+# 写真を受け付けたときの返事（送った人の1対1のトークにだけ出る）。この後に何が起きるかを伝える
+# （グループへの知らせは、管理者が確定したときに送る）
+RECEIVED_MESSAGE = "写真を受け付けました。管理者が確認後、落とし物グループにお知らせします。"
+
+
+def reply(reply_token: str, text: str) -> None:
+    """届いたメッセージに返事をする（送った人の1対1のトークに出る）。
+
+    返事（reply）は、無料の通数（月200通）に数えられない。こちらから送る push とは違い、
+    届いたイベントに付いてくる返事のトークン（replyToken）を使い、1つのトークンで1回だけ、受け取ってから短い時間だけ使える。
+    だから DB に書く前（写真を取ってきた直後）に返す。DB の起動待ちで1分後のやり直しになると、トークンが切れているため。
+
+    返事に失敗しても、登録は続ける（例外にしない）。返事は知らせるだけで、登録のほうが大事なため。
+    やり直しの2回目では、トークンが使用済みか期限切れなので、ここは必ず失敗する（ログに残すだけ）。
+    """
+    body = {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
+    try:
+        line_request("POST", f"{LINE_API}/message/reply", body).close()
+    except urllib.error.HTTPError as e:
+        logger.warning("reply failed (%d): %s", e.code, e.read()[:200])
+
+
 def leave_group(group_id: str) -> None:
     """ボットがグループから退出する。"""
     line_request("POST", f"{LINE_API}/group/{group_id}/leave").close()
 
 
-def line_request(method: str, url: str) -> Any:
-    """LINE の API にリクエストを1本送り、返事（urlopen の結果）を返す。2xx でなければ HTTPError になる。"""
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {channel_access_token()}"},
-        method=method,
-    )
+def line_request(method: str, url: str, body: dict[str, Any] | None = None) -> Any:
+    """LINE の API にリクエストを1本送り、返事（urlopen の結果）を返す。2xx でなければ HTTPError になる。
+
+    body を渡したときは、JSON にして本文に入れる（返事を送るときに使う）。
+    """
+    headers = {"Authorization": f"Bearer {channel_access_token()}"}
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     return urllib.request.urlopen(request, timeout=LINE_TIMEOUT_SECONDS)
 
 
