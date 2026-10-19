@@ -81,7 +81,7 @@ variable "enable_cloudfront" {
 
 variable "line_group_id" {
   type        = string
-  description = "落とし物専用の LINE グループの ID（C から始まる33文字）。写真を登録してよいのは、このグループのメンバーだけ"
+  description = "落とし物専用の LINE グループの ID（C から始まる33文字）。写真を登録してよいのは、このグループのメンバーだけ。確定したらここに知らせる"
 
   # 空の間は、だれの写真も登録しない（グループが決まるまで、ボットを友だちに追加しただけの人が登録できないように）。
   # ID は、ボットをグループに招待したときに届く join イベントから取る（line-intake のログに出る）。

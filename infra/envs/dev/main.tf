@@ -972,6 +972,10 @@ resource "aws_lambda_function" "api" {
 
       # 署名付きURLで写真を置かせるバケット
       UPLOAD_BUCKET = aws_s3_bucket.uploads.bucket
+
+      # 確定したら落とし物グループに LINE で知らせる（ステップ11。読む権限は line.tf の api_line_token）
+      LINE_CHANNEL_ACCESS_TOKEN_ARN = aws_secretsmanager_secret.line_channel_access_token.arn
+      LINE_GROUP_ID                 = var.line_group_id
     }
   }
 

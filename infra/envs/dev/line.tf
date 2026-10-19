@@ -38,8 +38,8 @@
 #
 # 2つに分けているのは、読む Lambda が違うため:
 #   チャネルシークレット       … 届いたリクエストの署名を確かめる鍵。line-webhook だけが読む
-#   チャネルアクセストークン   … こちらから LINE の API を呼ぶ鍵（メンバーか確かめる・写真を取ってくる・グループに送る）。
-#                                line-intake と worker が読む
+#   チャネルアクセストークン   … こちらから LINE の API を呼ぶ鍵（メンバーか確かめる・写真を取ってくる・返事・グループに送る）。
+#                                line-intake と api（確定したらグループに知らせる）が読む
 # 1つにまとめると、使わない鍵まで読めてしまう。1つ月 $0.40。
 
 resource "aws_secretsmanager_secret" "line_channel_secret" {
@@ -277,6 +277,30 @@ resource "aws_lambda_function" "line_intake" {
 resource "aws_lambda_function_event_invoke_config" "line_intake" {
   function_name          = aws_lambda_function.line_intake.function_name
   maximum_retry_attempts = 2
+}
+
+# ---------------------------------------------------------------------------
+# API（main.tf の Lambda: api）から落とし物グループに知らせる
+# ---------------------------------------------------------------------------
+#
+# 管理者が確定（POST /items/{item_id}/confirm）したら、API が LINE の push でグループに知らせる（backend/api/line_notify.py）。
+# 環境変数（アクセストークンの場所・グループ ID）は main.tf の aws_lambda_function.api に書いてある。
+# LINE に関わる権限は、このファイルにまとめる。
+
+# 【権限ポリシー】API の実行ロールに、LINE の API を呼ぶ鍵（チャネルアクセストークン）を読む権限を足す。
+# チャネルシークレット（署名を確かめる鍵）は読まない。API は LINE からのリクエストを受けないため。
+resource "aws_iam_role_policy" "api_line_token" {
+  name = "read-line-channel-access-token"
+  role = aws_iam_role.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.line_channel_access_token.arn
+    }]
+  })
 }
 
 # ---------------------------------------------------------------------------

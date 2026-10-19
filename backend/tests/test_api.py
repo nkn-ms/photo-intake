@@ -12,6 +12,10 @@
 
 ■ S3
   署名付きURLは AWS に問い合わせずに作れる（偽の認証情報で署名するだけ）ので、偽物は要らない。
+
+■ LINE
+  確定したら落とし物グループに送る push（line_notify.push）を、送った内容を覚えておくだけの偽物に差し替える。
+  どのテストでも差し替える（autouse）ので、テストから本物の LINE に送ることは無い。
 """
 
 import json
@@ -23,6 +27,7 @@ from conftest import BUCKET
 
 import app
 import db
+import line_notify
 
 # --- JWT の中身（API Gateway が確かめ済みのもの）---
 
@@ -195,7 +200,9 @@ def test_登録すると行を作って署名付きURLを返す(data_api):
     assert sent["location"] is None  # 任意の項目は NULL
     assert sent["s3_key"].startswith("uploads/") and sent["s3_key"].endswith(".jpg")
     # 写真を置く URL は、東京の窓口・このバケット・この行のキー
-    assert body["upload_url"].startswith(f"https://{BUCKET}.s3.ap-northeast-1.amazonaws.com/{sent['s3_key']}?")
+    assert body["upload_url"].startswith(
+        f"https://{BUCKET}.s3.ap-northeast-1.amazonaws.com/{sent['s3_key']}?"
+    )
     assert body["upload_headers"] == {"Content-Type": "image/jpeg"}
 
 
@@ -260,7 +267,10 @@ def test_詳細はjsonbを戻して写真のURLを付ける(data_api):
     status, body, _ = call("GET", f"/items/{ITEM_ID}", claims=STAFF)
 
     assert status == 200
-    assert body["ai_result"]["features"] == ["二つ折り", "革製"]  # 文字列ではなく辞書・一覧に戻っている
+    assert body["ai_result"]["features"] == [
+        "二つ折り",
+        "革製",
+    ]  # 文字列ではなく辞書・一覧に戻っている
     assert body["photo_url"].startswith(
         f"https://{BUCKET}.s3.ap-northeast-1.amazonaws.com/{PENDING_ROW['s3_key']}?"
     )
@@ -294,7 +304,11 @@ def test_staffは確定できず403でDBに触らない(data_api):
 
 
 def test_adminが確定すると人の値と保管期限が入った詳細を返す(data_api):
-    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]  # 読む → 書く → 読み直す
+    data_api.answers = [
+        rows(PENDING_ROW),
+        updated(1),
+        rows(CONFIRMED_ROW),
+    ]  # 読む → 書く → 読み直す
 
     status, body, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
 
@@ -362,3 +376,62 @@ def test_DBが起動中ならどのルートでも送り直さずに503とRetryA
     assert status == 503
     assert headers["retry-after"] == "5"  # 画面はこの秒数だけ待ってやり直す
     assert len(data_api.calls) == 1  # Lambda の中では送り直さない（待つのは画面の役目）
+
+
+# ===========================================================================
+# 確定したら落とし物グループに LINE で知らせる（line_notify.py）
+# ===========================================================================
+
+GROUP = "C" + "2" * 32
+
+
+@pytest.fixture(autouse=True)
+def pushes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """LINE の push を偽物にする。送った（宛先, 文面）を順に覚えておく。落とし物グループは GROUP に決まっている状態にする。"""
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(line_notify, "push", lambda to, text: sent.append((to, text)))
+    monkeypatch.setattr(line_notify, "LINE_GROUP_ID", GROUP)
+    return sent
+
+
+def test_確定すると落とし物グループに知らせる(data_api, pushes):
+    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
+
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+
+    assert status == 200
+    # 値は人が確定したもの。拾得日時は UTC の 10/08 21:03 を日本時間（+9時間）にしたもの
+    assert pushes == [
+        (
+            GROUP,
+            "落とし物のお知らせ\n種別：財布\n色：—\nブランド：—\n拾得日時：10/09 06:03\n拾得場所：—",
+        )
+    ]
+
+
+def test_知らせに失敗しても確定は成功のまま(data_api, monkeypatch):
+    def broken_push(to: str, text: str) -> None:
+        raise OSError("LINE につながらない")
+
+    monkeypatch.setattr(line_notify, "push", broken_push)
+    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
+
+    status, body, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+
+    assert status == 200
+    assert body["status"] == "confirmed"
+
+
+def test_確定できなかったら知らせない(data_api, pushes):
+    data_api.answers = [rows(CONFIRMED_ROW)]  # もう確定済み → 409
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+    assert status == 409
+    assert pushes == []
+
+
+def test_落とし物グループが決まっていなければ知らせない(data_api, pushes, monkeypatch):
+    monkeypatch.setattr(line_notify, "LINE_GROUP_ID", "")
+    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+    assert status == 200
+    assert pushes == []

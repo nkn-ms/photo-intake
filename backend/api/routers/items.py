@@ -21,6 +21,7 @@ from pydantic import AfterValidator, BaseModel, Field
 
 from auth import User, get_current_user, require_admin
 from db import execute_sql, select_rows, text_or_null
+from line_notify import notify_line_group
 
 # ルートの入れ物。app.py が app.include_router(items.router) でアプリにつなぐ
 router = APIRouter()
@@ -392,7 +393,15 @@ def confirm_item(
         raise HTTPException(
             status_code=409, detail="ほかの人が先に状態を変えました。読み直してください"
         )
-    return get_item(item_id)  # 確定した後の行を、詳細と同じ形で返す（画面はこれで表示を更新できる）
+    # 確定した後の行を、詳細と同じ形で読む（画面はこれで表示を更新できる）
+    detail = get_item(item_id)
+
+    # 落とし物グループに LINE で知らせる。確定の書き込みが成功したときだけ、ここまで来る。
+    # 知らせに失敗しても、確定は成功のまま返す（line_notify.py）
+    notify_line_group(
+        detail.category, detail.color, detail.brand, detail.registered_at, detail.location
+    )
+    return detail
 
 
 # --- 部品 ---
