@@ -78,3 +78,22 @@ variable "enable_cloudfront" {
   # 解除されたら true にして make apply → make deploy-web の公開先を S3 に戻す。
   default = false
 }
+
+variable "line_group_id" {
+  type        = string
+  description = "落とし物専用の LINE グループの ID（C から始まる33文字）。写真を登録してよいのは、このグループのメンバーだけ"
+
+  # 空の間は、だれの写真も登録しない（グループが決まるまで、ボットを友だちに追加しただけの人が登録できないように）。
+  # ID は、ボットをグループに招待したときに届く join イベントから取る（line-intake のログに出る）。
+  # 人がログから写してここに書くことが、「このグループを落とし物グループにしてよい」という承認になる。
+  #
+  # PoC は1施設なので、グループ ID は一度決めたら変わらない設定として持つ。tfvars はローカルのファイルなので、
+  # destroy しても残る（DB に置くと、作り直すたびにボットを招待し直すことになる）。
+  # 複数の施設にするなら、施設の表と承認の手順を足して、グループを施設に結びつけて DB に置く。
+  default = ""
+
+  validation {
+    condition     = var.line_group_id == "" || can(regex("^C[0-9a-f]{32}$", var.line_group_id))
+    error_message = "line_group_id は空か、C から始まる33文字（C + 16進数32文字）の LINE のグループ ID。"
+  }
+}

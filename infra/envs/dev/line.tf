@@ -1,17 +1,33 @@
 # ===========================================================================
-# LINE の受け口（ステップ11）
+# LINE（ステップ11）
 # ===========================================================================
 #
 # ボット（LINE 公式アカウント）は、スタッフとの1対1のトーク（写真の投稿）と、落とし物専用のグループ（知らせ）で使う。
 # どちらでも何か起きるたびに、LINE のサーバーがここの URL（POST /line/webhook）にリクエストを送ってくる。
 #
-#   LINE ──POST /line/webhook──→ API Gateway ──→ Lambda: line（backend/line/webhook.py）
+#   LINE ──POST /line/webhook──→ API Gateway ──→ Lambda: line-webhook（backend/line/webhook.py）
+#                                                    署名を確かめ、届いたイベントを1つずつ
+#                                                    line-intake に非同期で渡し、すぐ 200 を返す
+#                                                         │
+#                                                         ▼
+#                                                  Lambda: line-intake（backend/line/intake.py）
+#                                                    イベントの種類で処理を選ぶ:
+#                                                    ・グループに招待された … グループ ID をログに出す（人が terraform.tfvars の
+#                                                      line_group_id に写す）。落とし物グループが決まった後なら、ほかのグループからは退出する
+#                                                    ・1対1で写真が届いた   … 送り主がそのグループのメンバーか確かめる →
+#                                                      写真を LINE から取ってくる → items に行を作る → S3 の uploads/ に置く
+#                                                      （ここから先は、画面から登録したときと同じ S3 → SQS → worker）
+#
+# 関数を2つに分けるのは、次の2つのため:
+#   ・LINE への返事を待たせない。DB（Aurora）が一時停止していると、起きるまで十数秒かかる。
+#     API Gateway は30秒で打ち切るうえ、LINE も「webhook はすぐ返事をして、重い処理は後で」と勧めている
+#   ・権限を分ける。インターネットから呼ばれる line-webhook は、署名を確かめる鍵を読むことと line-intake を呼ぶことしかできない。
+#     DB にも S3 にも触れないので、入口に万一穴があっても、そこから DB は触れない
+# 画面から登録するときの「API（受け付けてすぐ返す）→ S3 → SQS → worker（重い処理）」と同じ形。
 #
 # main.tf とは別のファイルにしているが、Terraform は同じフォルダの .tf をすべてまとめて読むので、
 # main.tf の中に書いたのと同じ扱いになる（aws_apigatewayv2_api.main などをそのまま参照できる）。
 # LINE の部分だけを1か所で読めるように分けた。
-#
-# 今（L3）は、署名を確かめて、届いたものをログに残すだけ。S3 や DB の権限は、写真を登録する L4 で足す。
 
 # ---------------------------------------------------------------------------
 # LINE の鍵の置き場所（Secrets Manager）
@@ -21,9 +37,10 @@
 # （tfstate にもコードにも鍵が残らない）。
 #
 # 2つに分けているのは、読む Lambda が違うため:
-#   チャネルシークレット       … 届いたリクエストの署名を確かめる鍵。line だけが読む
-#   チャネルアクセストークン   … こちらから LINE の API を呼ぶ鍵（写真を取ってくる・グループに送る）。line と worker が読む
-# 1つにまとめると、worker が使わないシークレットまで読めてしまう。1つ月 $0.40。
+#   チャネルシークレット       … 届いたリクエストの署名を確かめる鍵。line-webhook だけが読む
+#   チャネルアクセストークン   … こちらから LINE の API を呼ぶ鍵（メンバーか確かめる・写真を取ってくる・グループに送る）。
+#                                line-intake と worker が読む
+# 1つにまとめると、使わない鍵まで読めてしまう。1つ月 $0.40。
 
 resource "aws_secretsmanager_secret" "line_channel_secret" {
   name                    = "photo-intake-dev/line-channel-secret"
@@ -36,13 +53,11 @@ resource "aws_secretsmanager_secret" "line_channel_access_token" {
 }
 
 # ---------------------------------------------------------------------------
-# line Lambda の実行ロール
+# line-webhook（LINE から呼ばれる入口）
 # ---------------------------------------------------------------------------
-#
-# api・worker とは分ける。LINE の鍵を読めるのはこのロール（と、送るときの worker）だけにする。
 
-resource "aws_iam_role" "line" {
-  name = "photo-intake-dev-line"
+resource "aws_iam_role" "line_webhook" {
+  name = "photo-intake-dev-line-webhook"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -55,57 +70,64 @@ resource "aws_iam_role" "line" {
 }
 
 # 【権限ポリシー】ログを書く（全 Lambda に共通。AWS 既製のもの）。
-resource "aws_iam_role_policy_attachment" "line_logs" {
-  role       = aws_iam_role.line.name
+resource "aws_iam_role_policy_attachment" "line_webhook_logs" {
+  role       = aws_iam_role.line_webhook.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# 【権限ポリシー】LINE の鍵を2つとも読む（署名を確かめる・写真を取ってくる）。
-resource "aws_iam_role_policy" "line_secrets" {
-  name = "read-line-secrets"
-  role = aws_iam_role.line.name
+# 【権限ポリシー】署名を確かめる鍵（チャネルシークレット）を読む。アクセストークンは読まない。
+resource "aws_iam_role_policy" "line_webhook_secret" {
+  name = "read-line-channel-secret"
+  role = aws_iam_role.line_webhook.name
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
-      Action = "secretsmanager:GetSecretValue"
-      Resource = [
-        aws_secretsmanager_secret.line_channel_secret.arn,
-        aws_secretsmanager_secret.line_channel_access_token.arn,
-      ]
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.line_channel_secret.arn
     }]
   })
 }
 
-# ---------------------------------------------------------------------------
-# line Lambda 本体
-# ---------------------------------------------------------------------------
+# 【権限ポリシー】line-intake を呼ぶ。呼んでよい相手は line-intake だけに絞る。
+resource "aws_iam_role_policy" "line_webhook_invoke_intake" {
+  name = "invoke-line-intake"
+  role = aws_iam_role.line_webhook.name
 
-# webhook.py 1ファイルだけを zip にする（worker と同じ。ライブラリは Lambda に最初からある boto3 と標準ライブラリだけ使う）
-data "archive_file" "line" {
-  type        = "zip"
-  source_file = "${path.module}/../../../backend/line/webhook.py"
-  output_path = "${path.module}/.build/line.zip"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.line_intake.arn
+    }]
+  })
 }
 
-resource "aws_cloudwatch_log_group" "line" {
-  name              = "/aws/lambda/photo-intake-dev-line"
+# webhook.py 1ファイルだけを zip にする（worker と同じ。ライブラリは Lambda に最初からある boto3 と標準ライブラリだけ使う）
+data "archive_file" "line_webhook" {
+  type        = "zip"
+  source_file = "${path.module}/../../../backend/line/webhook.py"
+  output_path = "${path.module}/.build/line-webhook.zip"
+}
+
+resource "aws_cloudwatch_log_group" "line_webhook" {
+  name              = "/aws/lambda/photo-intake-dev-line-webhook"
   retention_in_days = 14
 }
 
-resource "aws_lambda_function" "line" {
-  function_name = "photo-intake-dev-line"
-  role          = aws_iam_role.line.arn
+resource "aws_lambda_function" "line_webhook" {
+  function_name = "photo-intake-dev-line-webhook"
+  role          = aws_iam_role.line_webhook.arn
 
-  filename         = data.archive_file.line.output_path
-  source_code_hash = data.archive_file.line.output_base64sha256
+  filename         = data.archive_file.line_webhook.output_path
+  source_code_hash = data.archive_file.line_webhook.output_base64sha256
 
   runtime = "python3.12"
   handler = "webhook.handler" # webhook.py の handler
 
-  # LINE は、返事が遅いと「届かなかった」とみなす。今は受け取ってログに残すだけなので1秒もかからない。
-  # L4 で写真を取ってきて S3 に置くようになったら、かかる時間を見て決め直す。
+  # 署名を確かめて line-intake に渡すだけなので、1秒もかからない（line-intake の終わりは待たない）
   timeout     = 10
   memory_size = 256
 
@@ -114,12 +136,147 @@ resource "aws_lambda_function" "line" {
       LOG_LEVEL = "INFO"
 
       # 鍵そのものではなく、鍵が入ったシークレットの場所（ARN）を渡す（worker の Anthropic のキーと同じ）
-      LINE_CHANNEL_SECRET_ARN       = aws_secretsmanager_secret.line_channel_secret.arn
-      LINE_CHANNEL_ACCESS_TOKEN_ARN = aws_secretsmanager_secret.line_channel_access_token.arn
+      LINE_CHANNEL_SECRET_ARN = aws_secretsmanager_secret.line_channel_secret.arn
+
+      # イベントを渡す先
+      LINE_INTAKE_FUNCTION_NAME = aws_lambda_function.line_intake.function_name
     }
   }
 
-  depends_on = [aws_cloudwatch_log_group.line]
+  depends_on = [aws_cloudwatch_log_group.line_webhook]
+}
+
+# ---------------------------------------------------------------------------
+# line-intake（写真を登録する。line-webhook からしか呼ばれない）
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_role" "line_intake" {
+  name = "photo-intake-dev-line-intake"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+# 【権限ポリシー】ログを書く。
+resource "aws_iam_role_policy_attachment" "line_intake_logs" {
+  role       = aws_iam_role.line_intake.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# 【権限ポリシー】LINE の API を呼ぶ鍵（チャネルアクセストークン）を読む。チャネルシークレットは読まない。
+resource "aws_iam_role_policy" "line_intake_token" {
+  name = "read-line-channel-access-token"
+  role = aws_iam_role.line_intake.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.line_channel_access_token.arn
+    }]
+  })
+}
+
+# 【権限ポリシー】items に行を作る（Data API）。API の api_db と同じ中身。
+resource "aws_iam_role_policy" "line_intake_db" {
+  name = "query-db"
+  role = aws_iam_role.line_intake.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "rds-data:ExecuteStatement"
+        Resource = aws_rds_cluster.main.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = aws_rds_cluster.main.master_user_secret[0].secret_arn
+      },
+    ]
+  })
+}
+
+# 【権限ポリシー】LINE から取ってきた写真を uploads/ の下に置く。
+# API と違って読まない（GetObject は付けない）。置いた後に読むのは worker。
+resource "aws_iam_role_policy" "line_intake_s3" {
+  name = "put-uploads"
+  role = aws_iam_role.line_intake.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:PutObject"
+      Resource = "${aws_s3_bucket.uploads.arn}/uploads/*"
+    }]
+  })
+}
+
+data "archive_file" "line_intake" {
+  type        = "zip"
+  source_file = "${path.module}/../../../backend/line/intake.py"
+  output_path = "${path.module}/.build/line-intake.zip"
+}
+
+resource "aws_cloudwatch_log_group" "line_intake" {
+  name              = "/aws/lambda/photo-intake-dev-line-intake"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "line_intake" {
+  function_name = "photo-intake-dev-line-intake"
+  role          = aws_iam_role.line_intake.arn
+
+  filename         = data.archive_file.line_intake.output_path
+  source_code_hash = data.archive_file.line_intake.output_base64sha256
+
+  runtime = "python3.12"
+  handler = "intake.handler" # intake.py の handler
+
+  # 長いのは、DB が一時停止から起きるのを待つときだけ（API と同じく最大20秒待つ）。
+  # それに、メンバーか確かめる・写真を取ってくる・置く時間を足した。
+  # line-webhook から非同期で呼ばれ、API Gateway を通らないので、30秒の打ち切りは受けない。
+  timeout     = 60
+  memory_size = 256
+
+  environment {
+    variables = {
+      LOG_LEVEL = "INFO"
+
+      LINE_CHANNEL_ACCESS_TOKEN_ARN = aws_secretsmanager_secret.line_channel_access_token.arn
+
+      # 落とし物グループ。写真を登録してよいのは、このグループのメンバーだけ（空の間は、だれの写真も登録しない）
+      LINE_GROUP_ID = var.line_group_id
+
+      # Data API に渡す3点セット（API・worker と同じもの）
+      DB_CLUSTER_ARN = aws_rds_cluster.main.arn
+      DB_SECRET_ARN  = aws_rds_cluster.main.master_user_secret[0].secret_arn
+      DB_NAME        = aws_rds_cluster.main.database_name
+
+      # 写真を置くバケット
+      UPLOAD_BUCKET = aws_s3_bucket.uploads.bucket
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.line_intake]
+}
+
+# 非同期で呼ばれた line-intake が失敗したとき、Lambda が自動でやり直す回数（2 は AWS の既定値。見えるように書いておく）。
+# やり直しは1分後・さらに2分後。DB が起ききらずに失敗しても、やり直す頃には起きている。
+# 同じ写真を2回登録しないように、S3 のキーは LINE のメッセージ ID から決める（intake.py）。
+resource "aws_lambda_function_event_invoke_config" "line_intake" {
+  function_name          = aws_lambda_function.line_intake.function_name
+  maximum_retry_attempts = 2
 }
 
 # ---------------------------------------------------------------------------
@@ -128,31 +285,31 @@ resource "aws_lambda_function" "line" {
 #
 # main.tf の API Gateway（aws_apigatewayv2_api.main）に、ルートを1本足す。URL は API と同じドメインになる。
 
-# 行き先：line Lambda（API の Lambda と同じ形。payload 2.0）
-resource "aws_apigatewayv2_integration" "line" {
+# 行き先：line-webhook（API の Lambda と同じ形。payload 2.0）
+resource "aws_apigatewayv2_integration" "line_webhook" {
   api_id                 = aws_apigatewayv2_api.main.id
   integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.line.invoke_arn
+  integration_uri        = aws_lambda_function.line_webhook.invoke_arn
   payload_format_version = "2.0"
 }
 
 # JWT を求めない（authorization_type を書かない＝NONE）。LINE は Cognito のトークンを持っていないため。
-# 代わりに、line Lambda が LINE の署名を確かめる（L3）。
+# 代わりに、line-webhook が LINE の署名を確かめる。
 #
 # main.tf には「POST /{proxy+}（どんなパスでも・JWT 必須）」のルートがあるが、ぶつからない。
 # API Gateway は、具体的に書いたパス（/line/webhook）を {proxy+} より優先して当てる。
 resource "aws_apigatewayv2_route" "line_webhook" {
   api_id    = aws_apigatewayv2_api.main.id
   route_key = "POST /line/webhook"
-  target    = "integrations/${aws_apigatewayv2_integration.line.id}"
+  target    = "integrations/${aws_apigatewayv2_integration.line_webhook.id}"
 }
 
-# 「この API Gateway は、line Lambda を呼んでよい」（main.tf の api_gateway と同じ考え方）。
+# 「この API Gateway は、line-webhook を呼んでよい」（main.tf の api_gateway と同じ考え方）。
 # source_arn で、この API の、POST /line/webhook のルートからの呼び出しだけに絞る。
-resource "aws_lambda_permission" "line_api_gateway" {
+resource "aws_lambda_permission" "line_webhook_api_gateway" {
   statement_id  = "AllowInvokeFromApiGateway"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.line.function_name
+  function_name = aws_lambda_function.line_webhook.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/POST/line/webhook"
 }

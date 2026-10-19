@@ -1,4 +1,4 @@
-"""LINE の webhook を受け取る Lambda（ステップ11）。
+"""LINE の webhook を受け取る Lambda: line-webhook（ステップ11）。
 
 ボット（LINE 公式アカウント「photo-intake 落とし物」）は2つの場所で使う:
   ・スタッフとボットの1対1のトーク … スタッフが拾得物の写真を送る（他の人には見えない）
@@ -7,11 +7,12 @@
 LINE のサーバーが API Gateway の POST /line/webhook にリクエストを送ってくる。ここはその受け口。
 こちらから LINE に聞きに行くのではなく、LINE のほうから知らせてくる（これが webhook）。
 
-作る順番:
-  L2      … 届いたことをログに残して 200 を返すだけ
-  L3（今）… 署名を確かめる（本当に LINE から来たリクエストか）。違えば 401 で断る
-  L4      … 登録したスタッフから1対1で届いた写真を LINE から取ってきて items に行を作り、S3 に置く
-            （その後は画面から登録したときと同じ流れ）。グループに送られた写真は無視する
+この関数がすることは、入口の確かめだけ:
+  1. 署名を確かめる（本当に LINE から来たリクエストか）。違えば 401 で断る
+  2. 届いたイベントを1つずつ line-intake（intake.py）に渡す。終わるのは待たない
+  3. すぐ 200 を返す
+どのイベントをどう扱うか（写真を登録する・招待されたグループの ID をログに出す、など）は、line-intake が決める。
+この関数は DB にも S3 にも触れない（line.tf で権限を分けている）。
 
 ファイル名を handler.py にしないのは、テストのときに worker の handler.py と名前がぶつかるため
 （pyproject.toml の pythonpath で、worker/ と line/ の両方を import できるようにしている）。
@@ -32,9 +33,13 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 secrets = boto3.client("secretsmanager")  # LINE の鍵を読む
+lambda_client = boto3.client("lambda")  # line-intake を呼ぶ
 
 # 鍵そのものではなく、鍵が入ったシークレットの場所（line.tf が環境変数で渡す）
 LINE_CHANNEL_SECRET_ARN = os.environ["LINE_CHANNEL_SECRET_ARN"]
+
+# 写真を渡す先（line-intake の関数名）
+LINE_INTAKE_FUNCTION_NAME = os.environ["LINE_INTAKE_FUNCTION_NAME"]
 
 
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
@@ -50,17 +55,19 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
 
     # LINE が送ってくる本文は {"destination": "...", "events": [...]} の形の JSON。
     # 設定画面の「検証」ボタンは、events が空の本文を送ってくる。
-    events = json.loads(body).get("events", [])
+    events: list[dict[str, Any]] = json.loads(body).get("events", [])
 
-    # 今は、何が届いたか（イベントの種類と、どこから来たか）だけをログに残す。
-    # 例：[('join', 'group'), ('message', 'user')]
+    # 何が届いたか（イベントの種類と、どこから来たか）をログに残す。例：[('join', 'group'), ('message', 'user')]
     logger.info(
         "received %d events: %s",
         len(events),
         [(e.get("type"), e.get("source", {}).get("type")) for e in events],
     )
 
-    # LINE は 200 が返らないと「届かなかった」とみなす。中身を処理できなくても、受け取ったことは 200 で返す。
+    for e in events:
+        hand_over(e)
+
+    # LINE は 200 が返らないと「届かなかった」とみなす。中身の処理は line-intake が後で行うので、ここではすぐ返す。
     return {"statusCode": 200, "body": ""}
 
 
@@ -89,6 +96,22 @@ def is_valid_signature(body: bytes, signature: str, secret: str) -> bool:
     # == で比べると、先頭から何文字合っていたかで返るまでの時間がわずかに変わり、
     # 時間を測って1文字ずつ当てる攻撃に使われうる。compare_digest は合っていてもいなくても同じ時間で比べる
     return hmac.compare_digest(expected, signature)
+
+
+def hand_over(e: dict[str, Any]) -> None:
+    """イベント1つの処理を line-intake に頼む。終わるのは待たない。
+
+    InvocationType="Event" が「非同期で呼ぶ」の指定。Lambda が頼みを受け付けた時点で返ってくる（数十ミリ秒）。
+    line-intake が失敗したら、Lambda が自動でやり直す（line.tf の aws_lambda_function_event_invoke_config）。
+    イベントは1つずつ頼む。まとめて頼むと、1つの失敗で全部がやり直しになるため。
+    写真のイベントでも、中に入っているのは写真の中身ではなく、LINE のメッセージ ID だけ
+    （line-intake が、それを使って LINE から取ってくる）。
+    """
+    lambda_client.invoke(
+        FunctionName=LINE_INTAKE_FUNCTION_NAME,
+        InvocationType="Event",
+        Payload=json.dumps(e).encode("utf-8"),
+    )
 
 
 # functools.cache：1回目に読んだ値を覚えておき、2回目からは Secrets Manager に聞かない（worker の API キーと同じ）。
