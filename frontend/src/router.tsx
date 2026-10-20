@@ -14,7 +14,7 @@ import ItemDetailPage from './pages/ItemDetailPage'
 import ItemListPage from './pages/ItemListPage'
 
 // createBrowserRouter：URL を /items/… の普通の形にする（# の付く形ではなく）。
-// 公開先（Cloudflare Pages）で /items/… を直接開かれても index.html が返るので、そのまま動く
+// 公開先（CloudFront）で /items/… を直接開かれても index.html が返るので、そのまま動く（infra/envs/dev/main.tf の custom_error_response）
 export const router = createBrowserRouter([
   {
     path: '/',

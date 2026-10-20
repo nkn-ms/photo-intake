@@ -23,12 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# wrangler files
-.wrangler
-.dev.vars*
-!.dev.vars.example
+# 環境ごとの値（make web-env が書き出す .env.local など）
 .env*
 !.env.example
-
-# wrangler（Cloudflare の CLI）が作る作業用のフォルダ
-.wrangler

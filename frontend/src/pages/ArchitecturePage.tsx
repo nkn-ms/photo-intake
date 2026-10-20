@@ -103,10 +103,6 @@ export default function ArchitecturePage() {
 
       <Section title="今は代わりのものを使っているところ">
         <li>
-          <b>画面の置き場所：Cloudflare Workers。</b>本来は CloudFront + S3。AWS アカウントの確認が済むまで CloudFront
-          を作れなかったための代わり（確認は済み、CloudFront は作成済み。画面を S3 に置けば切り替えられる）
-        </li>
-        <li>
           <b>AI：Claude API（Anthropic）を直接。</b>本来は Bedrock（コードは analyzer = bedrock で切り替える。Bedrock はアカウントの制限が解けるのを待っている）。写真が AWS
           の外に出るので、本番では Bedrock にする
         </li>

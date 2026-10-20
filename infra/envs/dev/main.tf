@@ -1024,13 +1024,11 @@ resource "aws_apigatewayv2_api" "main" {
 locals {
   # API を呼んでよい・写真を PUT してよい画面のオリジン（API Gateway と uploads バケットの CORS で使う）:
   #   ・ローカルの開発サーバー（npm run dev）
-  #   ・CloudFront で公開した画面（9e）
-  #   ・Cloudflare Workers で公開した画面（CloudFront を作れない間の代わり。variables.tf の enable_cloudfront）
-  # CloudFront の URL は、作ったときだけ足す（for で「作った分だけ」並べる。作っていなければ空の一覧）
-  web_origins = concat(
-    ["http://localhost:5173", "https://photo-intake.nkn-ms.workers.dev"],
-    [for d in aws_cloudfront_distribution.web : "https://${d.domain_name}"],
-  )
+  #   ・CloudFront で公開した画面
+  web_origins = [
+    "http://localhost:5173",
+    "https://${aws_cloudfront_distribution.web.domain_name}",
+  ]
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -1191,9 +1189,6 @@ data "aws_cloudfront_response_headers_policy" "security_headers" {
 # ディストリビューション：CloudFront の設定1つ分。作ると https://xxxx.cloudfront.net の URL が1つもらえる。
 # 作るのにも消すのにも数分かかる（世界中の拠点に設定を配るため）。
 resource "aws_cloudfront_distribution" "web" {
-  # count：作る数。enable_cloudfront が false なら 0 個（作らない）。以降は aws_cloudfront_distribution.web[0] で指す
-  count = var.enable_cloudfront ? 1 : 0
-
   enabled             = true
   comment             = "photo-intake-dev web"
   default_root_object = "index.html"     # https://xxxx.cloudfront.net/ で来たときに返すファイル
@@ -1223,8 +1218,8 @@ resource "aws_cloudfront_distribution" "web" {
   #
   # /items/9d46… を直接開くと（再読み込み・ブックマーク・リンクの共有）、CloudFront は S3 に
   # 「items/9d46…」というファイルを取りに行くが、そんなファイルは無い。そのまま返すとエラーの画面になる。
-  # 代わりに index.html を 200 で返せば、ブラウザで vue-router が URL を見て詳細ページを出す
-  # （router.ts の createWebHistory のコメントで「9e で要る」と書いた設定。ローカルでは Vite が同じことをしていた）。
+  # 代わりに index.html を 200 で返せば、ブラウザで React Router が URL を見て詳細ページを出す
+  # （frontend/src/router.tsx の createBrowserRouter。ローカルでは Vite の開発サーバーが同じことをしている）。
   #
   # 404 だけでなく 403 も書くのは、S3 が「無い」を 403 で返すため。CloudFront にはバケットの一覧を見る権限を
   # 渡していないので、S3 は「無い」のか「読めない」のかを言わずに 403 にする（何があるかを外から探られないように）。
@@ -1259,8 +1254,6 @@ resource "aws_cloudfront_distribution" "web" {
 #   ①この CloudFront だけに、ファイルを読ませる（OAC の署名付きリクエストを受け付ける）
 #   ②HTTPS 以外のリクエストは拒否する（uploads と同じ文）
 resource "aws_s3_bucket_policy" "web" {
-  count = var.enable_cloudfront ? 1 : 0 # ①がディストリビューションを指すので、作るときだけ作る
-
   bucket = aws_s3_bucket.web.id
 
   policy = jsonencode({
@@ -1276,7 +1269,7 @@ resource "aws_s3_bucket_policy" "web" {
         # 「CloudFront なら何でも」ではなく「このディストリビューションからのみ」に絞る。
         # これが無いと、他人のアカウントの CloudFront からもこのバケットを読めてしまう（SQS のキューポリシーと同じ考え方）
         Condition = {
-          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.web[0].arn }
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.web.arn }
         }
       },
       {
@@ -1295,10 +1288,23 @@ resource "aws_s3_bucket_policy" "web" {
   depends_on = [aws_s3_bucket_public_access_block.web]
 }
 
+# 2026-10-20：enable_cloudfront（CloudFront を作るかどうかの切り替え）を消し、count をやめた。
+# count があると state の中の名前は aws_cloudfront_distribution.web[0]、無いと aws_cloudfront_distribution.web になる。
+# moved ブロックで「名前が変わっただけ」と Terraform に伝える。無いと、別のものと見なして消して作り直す
+# （CloudFront の URL が変わり、作り直しに数分かかる）。apply して state の名前が変わった後は、消してもよい。
+moved {
+  from = aws_cloudfront_distribution.web[0]
+  to   = aws_cloudfront_distribution.web
+}
+
+moved {
+  from = aws_s3_bucket_policy.web[0]
+  to   = aws_s3_bucket_policy.web
+}
+
 # 画面を開く URL。スマホではこれを開く
 output "web_url" {
-  # one：要素が1個ならそれを、0個なら null を返す（CloudFront を作っていない間は null）
-  value = one([for d in aws_cloudfront_distribution.web : "https://${d.domain_name}"])
+  value = "https://${aws_cloudfront_distribution.web.domain_name}"
 }
 
 # make deploy-web が使う（ファイルを置く先と、キャッシュを消す相手）
@@ -1307,5 +1313,5 @@ output "web_bucket" {
 }
 
 output "web_distribution_id" {
-  value = one(aws_cloudfront_distribution.web[*].id) # [*]：作った分の id を一覧にする
+  value = aws_cloudfront_distribution.web.id
 }
