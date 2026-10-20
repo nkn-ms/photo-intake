@@ -1,18 +1,18 @@
 """LINE の webhook を受け取る Lambda: line-webhook（ステップ11）。
 
-ボット（LINE 公式アカウント「photo-intake 落とし物」）は2つの場所で使う:
-  ・スタッフとボットの1対1のトーク … スタッフが拾得物の写真を送る（他の人には見えない）
-  ・落とし物専用のグループ           … 解析が終わったら、worker がここに知らせる
-どちらでも、何か起きるたびに（写真が送られた・ボットがグループに招待された、など）、
-LINE のサーバーが API Gateway の POST /line/webhook にリクエストを送ってくる。ここはその受け口。
+LINE の公式アカウントで何か起きるたびに（写真が送られた・ボットがグループに招待された、など）、
+LINE のサーバーが API Gateway の webhook の URL にリクエストを送ってくる。ここはその受け口。
 こちらから LINE に聞きに行くのではなく、LINE のほうから知らせてくる（これが webhook）。
 
 この関数がすることは、入口の確かめだけ:
   1. 署名を確かめる（本当に LINE から来たリクエストか）。違えば 401 で断る
-  2. 届いたイベントを1つずつ line-intake（intake.py）に渡す。終わるのは待たない
+  2. 届いたイベントを1つずつ、渡す先の関数（FORWARD_FUNCTION_NAME）に渡す。終わるのは待たない
   3. すぐ 200 を返す
-どのイベントをどう扱うか（写真を登録する・招待されたグループの ID をログに出す、など）は、line-intake が決める。
-この関数は DB にも S3 にも触れない（line.tf で権限を分けている）。
+どのイベントをどう扱うかは、渡す先の関数が決める。この関数は DB にも S3 にも触れない（line.tf で権限を分けている）。
+
+同じコードを、公式アカウントの数だけ別の Lambda として置ける。webhook の URL は公式アカウントごとに1つなので、
+アカウントごとに「どの鍵で署名を確かめるか（LINE_CHANNEL_SECRET_ARN）」と「どこに渡すか（FORWARD_FUNCTION_NAME）」を
+環境変数で変える（line.tf）。今は、スタッフ用のアカウント「photo-intake 落とし物」の受け口として、line-intake（intake.py）に渡す。
 
 ファイル名を handler.py にしないのは、テストのときに worker の handler.py と名前がぶつかるため
 （pyproject.toml の pythonpath で、worker/ と line/ の両方を import できるようにしている）。
@@ -33,13 +33,13 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 secrets = boto3.client("secretsmanager")  # LINE の鍵を読む
-lambda_client = boto3.client("lambda")  # line-intake を呼ぶ
+lambda_client = boto3.client("lambda")  # 渡す先の関数を呼ぶ
 
 # 鍵そのものではなく、鍵が入ったシークレットの場所（line.tf が環境変数で渡す）
 LINE_CHANNEL_SECRET_ARN = os.environ["LINE_CHANNEL_SECRET_ARN"]
 
-# 写真を渡す先（line-intake の関数名）
-LINE_INTAKE_FUNCTION_NAME = os.environ["LINE_INTAKE_FUNCTION_NAME"]
+# イベントを渡す先の関数名（スタッフ用のアカウントなら line-intake。line.tf が環境変数で渡す）
+FORWARD_FUNCTION_NAME = os.environ["FORWARD_FUNCTION_NAME"]
 
 
 def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
@@ -67,7 +67,7 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
     for e in events:
         hand_over(e)
 
-    # LINE は 200 が返らないと「届かなかった」とみなす。中身の処理は line-intake が後で行うので、ここではすぐ返す。
+    # LINE は 200 が返らないと「届かなかった」とみなす。中身の処理は渡す先の関数が後で行うので、ここではすぐ返す。
     return {"statusCode": 200, "body": ""}
 
 
@@ -99,16 +99,16 @@ def is_valid_signature(body: bytes, signature: str, secret: str) -> bool:
 
 
 def hand_over(e: dict[str, Any]) -> None:
-    """イベント1つの処理を line-intake に頼む。終わるのは待たない。
+    """イベント1つの処理を、渡す先の関数に頼む。終わるのは待たない。
 
     InvocationType="Event" が「非同期で呼ぶ」の指定。Lambda が頼みを受け付けた時点で返ってくる（数十ミリ秒）。
-    line-intake が失敗したら、Lambda が自動でやり直す（line.tf の aws_lambda_function_event_invoke_config）。
+    渡す先の関数が失敗したら、Lambda が自動でやり直す（line.tf の aws_lambda_function_event_invoke_config）。
     イベントは1つずつ頼む。まとめて頼むと、1つの失敗で全部がやり直しになるため。
     写真のイベントでも、中に入っているのは写真の中身ではなく、LINE のメッセージ ID だけ
     （line-intake が、それを使って LINE から取ってくる）。
     """
     lambda_client.invoke(
-        FunctionName=LINE_INTAKE_FUNCTION_NAME,
+        FunctionName=FORWARD_FUNCTION_NAME,
         InvocationType="Event",
         Payload=json.dumps(e).encode("utf-8"),
     )

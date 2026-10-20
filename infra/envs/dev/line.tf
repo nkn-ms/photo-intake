@@ -138,8 +138,8 @@ resource "aws_lambda_function" "line_webhook" {
       # 鍵そのものではなく、鍵が入ったシークレットの場所（ARN）を渡す（worker の Anthropic のキーと同じ）
       LINE_CHANNEL_SECRET_ARN = aws_secretsmanager_secret.line_channel_secret.arn
 
-      # イベントを渡す先
-      LINE_INTAKE_FUNCTION_NAME = aws_lambda_function.line_intake.function_name
+      # イベントを渡す先（webhook.py は、渡す先を環境変数で変えれば、ほかの公式アカウントの受け口にも使える）
+      FORWARD_FUNCTION_NAME = aws_lambda_function.line_intake.function_name
     }
   }
 

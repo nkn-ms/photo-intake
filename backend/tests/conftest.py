@@ -39,10 +39,14 @@ os.environ["MAX_RECEIVE_COUNT"] = "3"
 # Bedrock は moto で偽物にできないので、本物を呼ばない側にしておく。答えはテストごとに差し替える
 os.environ["ANALYZER"] = "dummy"
 # LINE の受け口（line/webhook.py）が読む。鍵の値はテストの中で差し替えるので、場所は偽物でよい
-os.environ["LINE_CHANNEL_SECRET_ARN"] = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:line"
-os.environ["LINE_INTAKE_FUNCTION_NAME"] = "test-line-intake"
+os.environ["LINE_CHANNEL_SECRET_ARN"] = (
+    "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:line"
+)
+os.environ["FORWARD_FUNCTION_NAME"] = "test-line-intake"
 # line-intake（line/intake.py）が読む。アクセストークンはテストの中で差し替える
-os.environ["LINE_CHANNEL_ACCESS_TOKEN_ARN"] = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:token"
+os.environ["LINE_CHANNEL_ACCESS_TOKEN_ARN"] = (
+    "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:token"
+)
 
 
 # --- 2. moto（偽の AWS）---
