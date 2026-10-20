@@ -7,8 +7,8 @@
 LINE の不調で確定の操作ができなくなるほうが困るため。失敗はログに残す。
 
 知らせには写真も付ける。LINE の画像メッセージは、LINE のサーバーが写真の URL から取りに行く作りなので、
-ログイン無しで開ける URL が要る。そこで写真を web バケットの notify/ の下に、落とし物の ID の名前でコピーし、
-CloudFront の URL を送る（理由と割り切りは infra/envs/dev/line.tf の api_notify_photo のコメント）。
+ログイン無しで開ける URL が要る。そこで写真を知らせの写真のバケット（notify）に、落とし物の ID の名前でコピーし、
+写真専用の CloudFront の URL を送る（理由と割り切りは infra/envs/dev/line.tf の「知らせに写真を付ける」のコメント）。
 写真を付けられないとき（CloudFront が無い・形式が合わない・コピーに失敗した）は、文字だけで知らせる。
 
 LINE の API は、line-intake・worker と同じく Python の標準の urllib で呼ぶ（LINE の SDK は使わない）。
@@ -31,9 +31,9 @@ logger = logging.getLogger()
 LINE_CHANNEL_ACCESS_TOKEN_ARN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN_ARN", "")
 LINE_GROUP_ID = os.environ.get("LINE_GROUP_ID", "")  # 落とし物グループ。空なら知らせない
 UPLOAD_BUCKET = os.environ.get("UPLOAD_BUCKET", "")  # 写真の原本があるバケット（コピー元）
-# 写真のコピーを置くバケット（web バケット）
+# 写真のコピーを置くバケット（notify バケット）
 NOTIFY_PHOTO_BUCKET = os.environ.get("NOTIFY_PHOTO_BUCKET", "")
-# 写真の URL のうちファイル名より前の部分（例：https://xxxx.cloudfront.net/notify）。空なら写真を付けない
+# 写真の URL のうちファイル名より前の部分（例：https://yyyy.cloudfront.net）。空なら写真を付けない
 NOTIFY_PHOTO_BASE_URL = os.environ.get("NOTIFY_PHOTO_BASE_URL", "")
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -43,9 +43,9 @@ LINE_TIMEOUT_SECONDS = 5
 # 拾得日時を日本時間で書く。zoneinfo（"Asia/Tokyo"）でもよいが、日本に夏時間は無いので +9時間の固定で足りる
 JST = timezone(timedelta(hours=9), "JST")
 
-# LINE の画像メッセージが受け付ける形式は JPEG と PNG だけ。
+# LINE の画像メッセージが受け付ける形式は JPEG と PNG だけ。拡張子と、コピーに付ける Content-Type の組。
 # 画面から登録した写真は必ず JPEG にしてから送っていて（frontend/src/image.ts）、LINE から届く写真も JPEG なので、ふつうは合う
-LINE_IMAGE_EXTENSIONS = (".jpg", ".png")
+LINE_IMAGE_TYPES = {".jpg": "image/jpeg", ".png": "image/png"}
 
 secrets = boto3.client("secretsmanager")
 s3 = boto3.client("s3")
@@ -102,9 +102,9 @@ def notification_text(
 
 
 def publish_photo(item_id: uuid.UUID, s3_key: str) -> str | None:
-    """写真の原本を web バケットの notify/ の下にコピーし、LINE に渡す URL を返す。付けられないときは None。
+    """写真の原本を notify バケットにコピーし、LINE に渡す URL を返す。付けられないときは None。
 
-    コピーの名前は落とし物の ID にする（notify/<落とし物の ID>.jpg）。
+    コピーの名前は落とし物の ID にする（<落とし物の ID>.jpg）。
       ・落とし物の ID は DB がランダムに作る UUID（gen_random_uuid）なので、1つの URL からほかの写真の URL は推し量れない。
         原本のキーは使わない。LINE から来た写真のキーは、数字だけの LINE のメッセージ ID で推し量りやすいため
       ・原本（items の s3_key）とコピーを、落とし物の ID で突き合わせられる。写真を消すときに両方を消せる
@@ -118,19 +118,23 @@ def publish_photo(item_id: uuid.UUID, s3_key: str) -> str | None:
         logger.info("NOTIFY_PHOTO_BASE_URL is empty, notify without photo")
         return None
     extension = os.path.splitext(s3_key)[1]
-    if extension not in LINE_IMAGE_EXTENSIONS:
+    content_type = LINE_IMAGE_TYPES.get(extension)
+    if content_type is None:
         logger.info("LINE cannot show %s, notify without photo", extension)
         return None
 
     file_name = f"{item_id}{extension}"
     # S3 の中でコピーする（Lambda が写真を読み込んで書き直さなくてよい）。
-    # Content-Type（image/jpeg など）も原本のものがそのまま付く。CloudFront はそれを LINE に返す。
+    # Content-Type は原本のものを引き継がず、拡張子から決めて付け直す（MetadataDirective="REPLACE"）。
+    # 原本に何が付いていても、ブラウザと LINE には必ず画像として渡す（CloudFront の nosniff と組で、HTML として開かれない）。
     # コピーに失敗しても、文字だけで知らせる（写真が無いことより、知らせが届かないことのほうが困るため）
     try:
         s3.copy_object(
             Bucket=NOTIFY_PHOTO_BUCKET,
-            Key=f"notify/{file_name}",
+            Key=file_name,
             CopySource={"Bucket": UPLOAD_BUCKET, "Key": s3_key},
+            ContentType=content_type,
+            MetadataDirective="REPLACE",
         )
     except Exception:
         logger.exception("photo copy failed, notify without photo")

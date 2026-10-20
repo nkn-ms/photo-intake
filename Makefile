@@ -332,12 +332,22 @@ web-env:          ## 画面が使う値（User Pool・クライアント・API �
 	} > $(WEB_ENV)
 	@echo "書き出した: $(WEB_ENV)"; cat $(WEB_ENV)
 
-# 画面をビルドして Cloudflare Workers に公開する（9e。AWS アカウントの確認待ちで CloudFront を作れない間の代わり）。
-#   npm run build   … 型チェックをしてから frontend/dist に公開用のファイルを作る。
-#                     Vite はここで .env.local を読むので、make web-env の値がそのまま JS に入る
-#   wrangler deploy … frontend/wrangler.jsonc を読み、dist を Cloudflare に上げて公開する
-#                     （https://photo-intake.<workers.dev の名前>.workers.dev）
-# 初回だけ、先に cd frontend && npx wrangler login（ブラウザで Cloudflare にログイン）と、
-# ダッシュボードで workers.dev の名前（アカウントに1つ）の登録が要る。
-deploy-web:       ## 画面をビルドして Cloudflare Workers に公開する（CloudFront が使えない間の代わり）
-	cd frontend && npm run build && npx wrangler deploy
+# 画面をビルドして、S3（web バケット）に置き、CloudFront で公開する（https://xxxx.cloudfront.net 。URL は terraform output web_url で見られる）。
+#   npm run build … 型チェックをしてから frontend/dist に公開用のファイルを作る。
+#                   Vite はここで .env.local を読むので、make web-env の値がそのまま JS に入る
+#   ① assets/ を置く … JS・CSS。ファイル名に中身から作った文字（ハッシュ）が入っていて、中身が変われば名前も変わる。
+#                   だから「1年間、問い合わせずに使ってよい（immutable）」とブラウザに伝えてよい
+#   ② 残り（index.html・favicon.svg）を置く … index.html は名前が変わらないので「毎回、新しいか問い合わせて（no-cache）」にする。
+#                   これが古いままだと、新しい JS を読みに行かない。①の後に置くのは、新しい index.html が指す JS を先に揃えるため
+#   ③ キャッシュの無効化 … CloudFront の拠点が覚えている古いファイルを捨てさせる（"/*" は1件と数える。月1,000件まで無料）
+# --delete：dist に無いファイルは S3 からも消す（古い JS が溜まらないように）。
+# web バケットには画面のファイルしか置かない（LINE の知らせの写真は、line.tf の notify バケット）ので、消して困るものは無い。
+WEB_BUCKET = $$($(TF) output -raw web_bucket)
+deploy-web:       ## 画面をビルドして S3 に置き、CloudFront で公開する
+	cd frontend && npm run build
+	aws s3 sync frontend/dist/assets s3://$(WEB_BUCKET)/assets --delete \
+	  --cache-control "public, max-age=31536000, immutable"
+	aws s3 sync frontend/dist s3://$(WEB_BUCKET) --delete \
+	  --exclude "assets/*" --cache-control "no-cache"
+	aws cloudfront create-invalidation --distribution-id "$$($(TF) output -raw web_distribution_id)" \
+	  --paths "/*" --query Invalidation.Id --output text

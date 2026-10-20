@@ -978,10 +978,10 @@ resource "aws_lambda_function" "api" {
       LINE_GROUP_ID                 = var.line_group_id
 
       # 知らせに付ける写真のコピーを置くバケット（NOTIFY_PHOTO_BUCKET）と、その写真の URL のうちファイル名より前の部分
-      # （NOTIFY_PHOTO_BASE_URL。例：https://xxxx.cloudfront.net/notify）。API が後ろに「/落とし物の ID.jpg」を付けて LINE に送る。
-      # 置く権限と30日で消す決まりは line.tf。enable_cloudfront = false（CloudFront を作らない設定）のときは空にし、文字だけで知らせる
-      NOTIFY_PHOTO_BUCKET   = aws_s3_bucket.web.bucket
-      NOTIFY_PHOTO_BASE_URL = var.enable_cloudfront ? "https://${aws_cloudfront_distribution.web[0].domain_name}/notify" : ""
+      # （NOTIFY_PHOTO_BASE_URL。例：https://yyyy.cloudfront.net）。API が後ろに「/落とし物の ID.jpg」を付けて LINE に送る。
+      # バケット・写真専用の CloudFront・置く権限・30日で消す決まりは line.tf
+      NOTIFY_PHOTO_BUCKET   = aws_s3_bucket.notify.bucket
+      NOTIFY_PHOTO_BASE_URL = "https://${aws_cloudfront_distribution.notify.domain_name}"
     }
   }
 
@@ -1178,6 +1178,16 @@ data "aws_cloudfront_cache_policy" "caching_optimized" {
   name = "Managed-CachingOptimized"
 }
 
+# AWS が用意している「返すときに付けるヘッダー」のひな形。画面と、LINE の知らせの写真（line.tf）の CloudFront で使う。
+# SecurityHeadersPolicy は、次のヘッダーを付ける:
+#   X-Content-Type-Options: nosniff … Content-Type の通りにだけ扱い、中身を見て別の形式（HTML など）だと推し量らない
+#   Strict-Transport-Security      … このドメインには、これから1年間 HTTPS だけでつなぐ
+#   X-Frame-Options: SAMEORIGIN    … ほかのサイトの画面の中に埋め込ませない（見えない枠に重ねてクリックさせる手口を防ぐ）
+#   Referrer-Policy                … ほかのサイトへ移るときに、元の URL のパスまでは渡さない
+data "aws_cloudfront_response_headers_policy" "security_headers" {
+  name = "Managed-SecurityHeadersPolicy"
+}
+
 # ディストリビューション：CloudFront の設定1つ分。作ると https://xxxx.cloudfront.net の URL が1つもらえる。
 # 作るのにも消すのにも数分かかる（世界中の拠点に設定を配るため）。
 resource "aws_cloudfront_distribution" "web" {
@@ -1204,6 +1214,9 @@ resource "aws_cloudfront_distribution" "web" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true # JS・CSS を gzip / brotli で縮めて送る
     cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id
+
+    # セキュリティのヘッダーを付けて返す（上の data）
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.security_headers.id
   }
 
   # SPA のための設定：バケットに無いパスでも index.html を返す。

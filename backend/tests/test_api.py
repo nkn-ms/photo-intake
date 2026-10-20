@@ -384,8 +384,8 @@ def test_DBが起動中ならどのルートでも送り直さずに503とRetryA
 # ===========================================================================
 
 GROUP = "C" + "2" * 32
-WEB_BUCKET = "test-web"  # 知らせに付ける写真のコピーを置くバケット
-PHOTO_BASE_URL = "https://cdn.example.com/notify"  # 写真の URL のうちファイル名より前の部分
+NOTIFY_BUCKET = "test-notify"  # 知らせに付ける写真のコピーを置くバケット
+PHOTO_BASE_URL = "https://notify.example.com"  # 写真の URL のうちファイル名より前の部分
 
 # 確定した落とし物（CONFIRMED_ROW）の知らせの文字。拾得日時は UTC の 10/08 21:03 を日本時間（+9時間）にしたもの
 NOTIFICATION_TEXT = (
@@ -420,7 +420,7 @@ def photo_s3(monkeypatch: pytest.MonkeyPatch) -> FakeS3:
     """写真のコピーを偽物にする。CloudFront がある状態（URL が決まっている）にしておく。"""
     fake = FakeS3()
     monkeypatch.setattr(line_notify, "s3", fake)
-    monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BUCKET", WEB_BUCKET)
+    monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BUCKET", NOTIFY_BUCKET)
     monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BASE_URL", PHOTO_BASE_URL)
     return fake
 
@@ -431,12 +431,15 @@ def test_確定すると落とし物グループに写真付きで知らせる(d
     status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
 
     assert status == 200
-    # 原本（uploads/aeca10bb.jpg）を、web バケットの notify/<落とし物の ID>.jpg にコピーする
+    # 原本（uploads/aeca10bb.jpg）を、notify バケットの <落とし物の ID>.jpg にコピーする。
+    # Content-Type は原本から引き継がず、拡張子から決めて付け直す
     assert photo_s3.copies == [
         {
-            "Bucket": WEB_BUCKET,
-            "Key": f"notify/{ITEM_ID}.jpg",
+            "Bucket": NOTIFY_BUCKET,
+            "Key": f"{ITEM_ID}.jpg",
             "CopySource": {"Bucket": BUCKET, "Key": "uploads/aeca10bb.jpg"},
+            "ContentType": "image/jpeg",
+            "MetadataDirective": "REPLACE",
         }
     ]
     # 1回の push で、文字と写真の吹き出しを2つ送る。値は人が確定したもの

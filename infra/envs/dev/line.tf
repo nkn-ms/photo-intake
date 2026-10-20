@@ -309,15 +309,139 @@ resource "aws_iam_role_policy" "api_line_token" {
 # だから、ログイン無しで開ける HTTPS の URL が要る。uploads の署名付き URL は使えない
 # （API のロールの一時的な認証で署名するので、数時間で切れる。グループの過去の知らせの写真が見られなくなる）。
 #
-# そこで確定したときに、API が写真を web バケットの notify/ の下にコピーし、CloudFront の URL を送る。
+# そこで確定したときに、API が写真を「知らせの写真のバケット（notify）」にコピーし、notify 専用の CloudFront の URL を送る。
 #   ・ファイルの名前は落とし物の ID（DB がランダムに作る UUID）にする。1つの URL から、ほかの写真の URL は推し量れない
 #   ・30日たったら消す（下のライフサイクルの決まり）
-#   ・新しく公開のバケットは作らない。web バケットはもう CloudFront を通してだけ読める（S3 は非公開のまま）
+#   ・S3 は公開しない。uploads・web と同じく、パブリックアクセスを全部ブロックし、CloudFront だけに読ませる（OAC）
+#
+# 画面（web バケット・main.tf の CloudFront）とは、バケットも CloudFront（＝ドメイン）も分ける:
+#   ・ブラウザは、同じドメインから来たものを同じ仲間として扱う。利用者が送ったファイルが管理画面と同じドメインから出ると、
+#     写真のふりをした HTML や SVG が開かれたときに、その中の JavaScript が管理画面と同じ権限で動く（ログインのトークンを読める）。
+#     ドメインを分ければ、そうしたファイルが開かれても管理画面には触れない（GitHub が githubusercontent.com を分けているのと同じ理由）
+#   ・画面の公開（make deploy-web の sync --delete）が、写真を消すことが無い
+#   ・権限も分かれる。API が書けるのは notify バケットだけ、画面を公開する人（将来の CI）が書けるのは web バケットだけ
 #
 # 割り切り：URL を知っている人は、30日間はログイン無しで写真を見られる。URL が出るのは落とし物グループの中だけ。
-# 本番では写真専用のバケットに分けたほうが、権限を絞りやすい（画面のファイルと写真が同じバケットに入らない）。
 
-# 【権限ポリシー】API の実行ロールに、web バケットの notify/ の下に写真を置く権限を足す。
+# 知らせの写真のコピーを置くバケット
+resource "aws_s3_bucket" "notify" {
+  bucket = "photo-intake-dev-notify-${data.aws_caller_identity.current.account_id}"
+
+  # 中身は30日で消えるコピーだけで、原本は uploads にある。destroy で中身ごと消してよい
+  force_destroy = true
+}
+
+# uploads・web と同じく、パブリックアクセスを全部ブロックする（CloudFront に読ませる許可は「公開」に当たらない）
+resource "aws_s3_bucket_public_access_block" "notify" {
+  bucket = aws_s3_bucket.notify.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ライフサイクルの決まり：S3 が1日1回見回り、決まりに合うファイルを自動で消す（消すのは無料）。
+# このバケットには知らせの写真しか置かないので、全部のファイルを、置いてから30日で消す
+resource "aws_s3_bucket_lifecycle_configuration" "notify" {
+  bucket = aws_s3_bucket.notify.id
+
+  rule {
+    id     = "expire-notify-photos"
+    status = "Enabled"
+
+    filter {} # 空＝バケットの全部のファイルが対象
+
+    expiration {
+      days = 30
+    }
+  }
+}
+
+# OAC：CloudFront が notify バケットに写真を取りに行くとき、リクエストに署名を付ける設定（main.tf の web と同じ作り）
+resource "aws_cloudfront_origin_access_control" "notify" {
+  name                              = "photo-intake-dev-notify"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+# 知らせの写真だけを返す CloudFront。作ると、画面とは別の https://yyyy.cloudfront.net がもらえる。
+# 作るのにも消すのにも数分かかる。料金は使った分だけ（月 1TB・1,000万リクエストまでは無料の枠）
+resource "aws_cloudfront_distribution" "notify" {
+  enabled     = true
+  comment     = "photo-intake-dev notify photos"
+  price_class = "PriceClass_200" # 画面（main.tf）と同じ。日本を含み、料金の高い一部の地域を除く
+
+  origin {
+    origin_id                = "notify"
+    domain_name              = aws_s3_bucket.notify.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.notify.id
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "notify"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"] # 写真を読むだけ
+    cached_methods         = ["GET", "HEAD"]
+    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_optimized.id # main.tf の data（URL だけで見分け、1日覚える）
+
+    # セキュリティのヘッダーを付けて返す（main.tf の data）。とくに X-Content-Type-Options: nosniff で、
+    # 「Content-Type の通りにだけ扱い、中身を見て HTML だと推し量らない」ようブラウザに伝える
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.security_headers.id
+  }
+
+  # 画面と違い、無いファイルに index.html を返す設定（custom_error_response）は付けない。
+  # 30日たって消えた写真は、そのまま 403 になる
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+
+# notify バケットのバケットポリシー（web バケットと同じ2つの文）:
+#   ①この CloudFront だけに、写真を読ませる
+#   ②HTTPS 以外のリクエストは拒否する
+resource "aws_s3_bucket_policy" "notify" {
+  bucket = aws_s3_bucket.notify.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowCloudFrontRead"
+        Effect    = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.notify.arn}/*"
+        Condition = {
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.notify.arn }
+        }
+      },
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [aws_s3_bucket.notify.arn, "${aws_s3_bucket.notify.arn}/*"]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      },
+    ]
+  })
+
+  # パブリックアクセスのブロックを先に作る（web バケットと同じ）
+  depends_on = [aws_s3_bucket_public_access_block.notify]
+}
+
+# 【権限ポリシー】API の実行ロールに、notify バケットに写真を置く権限を足す。
 # コピーには、元を読む権限（uploads/ の GetObject）も要る。これは main.tf の api_s3 にもうある。
 resource "aws_iam_role_policy" "api_notify_photo" {
   name = "put-notify-photo"
@@ -328,32 +452,9 @@ resource "aws_iam_role_policy" "api_notify_photo" {
     Statement = [{
       Effect   = "Allow"
       Action   = "s3:PutObject"
-      Resource = "${aws_s3_bucket.web.arn}/notify/*" # 画面のファイル（index.html など）は書き換えられない
+      Resource = "${aws_s3_bucket.notify.arn}/*"
     }]
   })
-}
-
-# ライフサイクルの決まり：S3 が1日1回見回り、決まりに合うファイルを自動で消す（消すのは無料）。
-# notify/ の下のファイルだけを、置いてから30日で消す。画面のファイルは消さない。
-# 消えた後に LINE で写真を開くと、写真は出ない（CloudFront は無いファイルにも index.html を返すので、画像として開けない）。
-#
-# 注意：画面を web バケットに置くときに `aws s3 sync --delete` を使うなら、`--exclude "notify/*"` を付ける。
-# 付けないと、画面に無いファイルとして notify/ の写真まで消してしまう。
-resource "aws_s3_bucket_lifecycle_configuration" "web" {
-  bucket = aws_s3_bucket.web.id
-
-  rule {
-    id     = "expire-notify-photos"
-    status = "Enabled"
-
-    filter {
-      prefix = "notify/"
-    }
-
-    expiration {
-      days = 30
-    }
-  }
 }
 
 # ---------------------------------------------------------------------------
