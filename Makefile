@@ -314,7 +314,14 @@ items:            ## 最近登録した items を5件表示する
 	  --query formattedRecords --output text | python3 -m json.tool --no-ensure-ascii
 
 # --- フロント（ステップ9）---
-.PHONY: web-env deploy-web
+.PHONY: web-env deploy-web diagram
+
+# 構成図を、draw.io の図（docs/architecture.drawio）から PNG に書き出す（AWS には触らない）。
+# 書き出した PNG は、画面の「構成」ページと README.md の両方が使う。図を直したら、これを打ってからコミットする。
+#   drawio … draw.io のアプリ（brew install --cask drawio）に付いているコマンド。-x：書き出す、-f png：PNG で、
+#            -s 1.5：1.5倍の大きさで（Retina の画面でもぼやけないように）、-o：書き出す先
+diagram:          ## 構成図（docs/architecture.drawio）を PNG に書き出す
+	drawio -x -f png -s 1.5 -o frontend/src/architecture.png docs/architecture.drawio
 
 # 画面が使う値を、Terraform の出力から frontend/.env.local に書き出す（AWS には触らない。ローカルの state を読むだけ）。
 # destroy → apply のたびに User Pool の ID・API の URL が変わるので、apply の後に打ち直す。

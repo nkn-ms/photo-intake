@@ -43,6 +43,8 @@ out/
 *.[jJ][pP][eE][gG]
 *.[pP][nN][gG]
 *.[hH][eE][iI][cC]
+# 例外：構成図（make diagram で docs/architecture.drawio から書き出す。写真ではなく、README と画面の両方が使う）
+!frontend/src/architecture.png
 
 # 個人的なメモ・下書き・作業ログ。公開しない。
 docs/private/

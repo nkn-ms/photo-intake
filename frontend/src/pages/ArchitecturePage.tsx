@@ -1,86 +1,34 @@
 // 構成図のページ。ログインしなくても見られる（router.tsx で public にしている）。
-// 図は architecture.mmd（Mermaid の文字）から描く。README.md の構成図も同じ文字なので、画面と README で図がずれない
-import Alert from '@mui/material/Alert'
+// 図は docs/architecture.drawio（draw.io で描いた図）を make diagram で PNG に書き出したもの。
+// README.md の構成図も同じ PNG なので、画面と README で図がずれない
 import Box from '@mui/material/Box'
-import LinearProgress from '@mui/material/LinearProgress'
+import Link from '@mui/material/Link'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
-import { useTheme } from '@mui/material/styles'
-import { useEffect, useState, type ReactNode } from 'react'
-// ?raw：ファイルの中身を、そのまま1つの文字列として読み込む（Vite の機能）
-import diagram from '../architecture.mmd?raw'
-
-// mermaid.render に渡す ID は、描くたびに違うものにする。
-// 開発中は StrictMode が useEffect を2回動かすので、同じ ID だと描いている途中の2つがぶつかる
-let renderCount = 0
+import type { ReactNode } from 'react'
+// 画像を import すると、Vite はビルドしたときの画像の URL（ファイル名に中身から作った文字が入る）を返す
+import diagramUrl from '../architecture.png'
 
 export default function ArchitecturePage() {
-  const [svg, setSvg] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const fontFamily = useTheme().typography.fontFamily
-
-  // ページが出たときに1回、図を描く。ignore の役目は一覧のページと同じ（ページを離れた後の結果を捨てる）
-  useEffect(() => {
-    let ignore = false
-
-    async function draw(): Promise<void> {
-      try {
-        // import()：mermaid（数百 KB）を、このページを開いたときに初めて読む。
-        // 先頭で import すると、構成図を見ない人（登録だけする人）まで最初に読むことになる
-        const { default: mermaid } = await import('mermaid')
-        mermaid.initialize({
-          startOnLoad: false, // ページの中の .mermaid を自動で探して描く機能。React では自分で render を呼ぶので切る
-          theme: 'base', // 色を themeVariables で決める土台のテーマ
-          fontFamily,
-          themeVariables: {
-            primaryColor: '#e8f1ed', // 箱の塗り（theme.ts の緑を薄くした色）
-            primaryBorderColor: '#1e6b52', // 箱の線（theme.ts の緑）
-            primaryTextColor: '#1a1a1a',
-            lineColor: '#5f6b66', // 矢印
-            clusterBkg: '#f9fbfa', // 枠（subgraph）の塗り
-            clusterBorder: '#b9c8c1',
-          },
-        })
-        renderCount += 1
-        const result = await mermaid.render(`architecture-${renderCount}`, diagram)
-        if (!ignore) {
-          setSvg(result.svg)
-        }
-      } catch (e) {
-        if (!ignore) {
-          setError(`図を描けませんでした（${e instanceof Error ? e.message : String(e)}）`)
-        }
-      }
-    }
-
-    void draw()
-    return () => {
-      ignore = true
-    }
-  }, [fontFamily])
-
-  // 図の部分に出すものを、ガード節で上から順に決める
-  function figure() {
-    if (error) {
-      return <Alert severity="error">{error}</Alert>
-    }
-    if (svg === null) {
-      return <LinearProgress />
-    }
-    // dangerouslySetInnerHTML：文字列の HTML（ここでは SVG）をそのまま入れる。
-    // 人が入れた文字を入れると XSS の穴になるが、ここに入るのは architecture.mmd（自分たちのファイル）から作った SVG だけ。
-    // mermaid も既定（securityLevel: 'strict'）で、図の中の文字からスクリプトになるものを取り除いている
-    return <Box dangerouslySetInnerHTML={{ __html: svg }} sx={{ '& svg': { display: 'block', mx: 'auto' } }} />
-  }
-
   return (
     <Stack spacing={3}>
       <Typography variant="h5" component="h2" sx={{ fontWeight: 700 }}>
         構成
       </Typography>
       <Paper variant="outlined" sx={{ p: 2 }}>
-        {figure()}
+        {/* 図は横に長く、スマホでは文字が小さくなるので、押すと元の大きさの画像を新しいタブで開けるようにする */}
+        <Link href={diagramUrl} target="_blank" rel="noopener">
+          <Box
+            component="img"
+            src={diagramUrl}
+            alt="構成図。画面・API・解析・LINE・知らせの写真の流れを、AWS のアイコンで描いたもの"
+            sx={{ display: 'block', width: '100%', height: 'auto' }}
+          />
+        </Link>
+        <Typography variant="body2" sx={{ mt: 1, color: 'text.secondary' }}>
+          矢印の色：灰＝画面から・緑＝LINE から登録・青＝確定したら知らせる・赤＝失敗したとき。図を押すと大きく開く
+        </Typography>
       </Paper>
 
       <Section title="この構成の要点">
