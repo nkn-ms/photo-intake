@@ -284,7 +284,7 @@ resource "aws_lambda_function_event_invoke_config" "line_intake" {
 # ---------------------------------------------------------------------------
 #
 # 管理者が確定（POST /items/{item_id}/confirm）したら、API が LINE の push でグループに知らせる（backend/api/line_notify.py）。
-# 環境変数（アクセストークンの場所・グループ ID）は main.tf の aws_lambda_function.api に書いてある。
+# 環境変数（アクセストークンの場所・グループ ID・写真を置く場所）は main.tf の aws_lambda_function.api に書いてある。
 # LINE に関わる権限は、このファイルにまとめる。
 
 # 【権限ポリシー】API の実行ロールに、LINE の API を呼ぶ鍵（チャネルアクセストークン）を読む権限を足す。
@@ -301,6 +301,59 @@ resource "aws_iam_role_policy" "api_line_token" {
       Resource = aws_secretsmanager_secret.line_channel_access_token.arn
     }]
   })
+}
+
+# 知らせに写真を付ける。
+#
+# LINE の画像メッセージは、写真の URL を送り、LINE のサーバーがその URL から写真を取りに行く。
+# だから、ログイン無しで開ける HTTPS の URL が要る。uploads の署名付き URL は使えない
+# （API のロールの一時的な認証で署名するので、数時間で切れる。グループの過去の知らせの写真が見られなくなる）。
+#
+# そこで確定したときに、API が写真を web バケットの notify/ の下にコピーし、CloudFront の URL を送る。
+#   ・ファイルの名前は落とし物の ID（DB がランダムに作る UUID）にする。1つの URL から、ほかの写真の URL は推し量れない
+#   ・30日たったら消す（下のライフサイクルの決まり）
+#   ・新しく公開のバケットは作らない。web バケットはもう CloudFront を通してだけ読める（S3 は非公開のまま）
+#
+# 割り切り：URL を知っている人は、30日間はログイン無しで写真を見られる。URL が出るのは落とし物グループの中だけ。
+# 本番では写真専用のバケットに分けたほうが、権限を絞りやすい（画面のファイルと写真が同じバケットに入らない）。
+
+# 【権限ポリシー】API の実行ロールに、web バケットの notify/ の下に写真を置く権限を足す。
+# コピーには、元を読む権限（uploads/ の GetObject）も要る。これは main.tf の api_s3 にもうある。
+resource "aws_iam_role_policy" "api_notify_photo" {
+  name = "put-notify-photo"
+  role = aws_iam_role.api.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:PutObject"
+      Resource = "${aws_s3_bucket.web.arn}/notify/*" # 画面のファイル（index.html など）は書き換えられない
+    }]
+  })
+}
+
+# ライフサイクルの決まり：S3 が1日1回見回り、決まりに合うファイルを自動で消す（消すのは無料）。
+# notify/ の下のファイルだけを、置いてから30日で消す。画面のファイルは消さない。
+# 消えた後に LINE で写真を開くと、写真は出ない（CloudFront は無いファイルにも index.html を返すので、画像として開けない）。
+#
+# 注意：画面を web バケットに置くときに `aws s3 sync --delete` を使うなら、`--exclude "notify/*"` を付ける。
+# 付けないと、画面に無いファイルとして notify/ の写真まで消してしまう。
+resource "aws_s3_bucket_lifecycle_configuration" "web" {
+  bucket = aws_s3_bucket.web.id
+
+  rule {
+    id     = "expire-notify-photos"
+    status = "Enabled"
+
+    filter {
+      prefix = "notify/"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------

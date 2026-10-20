@@ -15,7 +15,8 @@
 
 ■ LINE
   確定したら落とし物グループに送る push（line_notify.push）を、送った内容を覚えておくだけの偽物に差し替える。
-  どのテストでも差し替える（autouse）ので、テストから本物の LINE に送ることは無い。
+  知らせに付ける写真のコピー（line_notify.s3.copy_object）も、頼まれた内容を覚えておくだけの偽物に差し替える。
+  どのテストでも差し替える（autouse）ので、テストから本物の LINE に送ることも、S3 に書くことも無い。
 """
 
 import json
@@ -383,34 +384,108 @@ def test_DBが起動中ならどのルートでも送り直さずに503とRetryA
 # ===========================================================================
 
 GROUP = "C" + "2" * 32
+WEB_BUCKET = "test-web"  # 知らせに付ける写真のコピーを置くバケット
+PHOTO_BASE_URL = "https://cdn.example.com/notify"  # 写真の URL のうちファイル名より前の部分
+
+# 確定した落とし物（CONFIRMED_ROW）の知らせの文字。拾得日時は UTC の 10/08 21:03 を日本時間（+9時間）にしたもの
+NOTIFICATION_TEXT = (
+    "落とし物のお知らせ\n種別：財布\n色：—\nブランド：—\n拾得日時：10/09 06:03\n拾得場所：—"
+)
+
+
+class FakeS3:
+    """line_notify の S3 の偽物。copy_object に頼まれた内容を順に覚えておく。broken なら失敗する。"""
+
+    def __init__(self) -> None:
+        self.copies: list[dict[str, Any]] = []
+        self.broken = False
+
+    def copy_object(self, **kwargs: Any) -> None:
+        if self.broken:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
+        self.copies.append(kwargs)
 
 
 @pytest.fixture(autouse=True)
-def pushes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
-    """LINE の push を偽物にする。送った（宛先, 文面）を順に覚えておく。落とし物グループは GROUP に決まっている状態にする。"""
-    sent: list[tuple[str, str]] = []
-    monkeypatch.setattr(line_notify, "push", lambda to, text: sent.append((to, text)))
+def pushes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, list[dict[str, Any]]]]:
+    """LINE の push を偽物にする。送った（宛先, 吹き出しの一覧）を順に覚えておく。落とし物グループは GROUP に決まっている状態にする。"""
+    sent: list[tuple[str, list[dict[str, Any]]]] = []
+    monkeypatch.setattr(line_notify, "push", lambda to, messages: sent.append((to, messages)))
     monkeypatch.setattr(line_notify, "LINE_GROUP_ID", GROUP)
     return sent
 
 
-def test_確定すると落とし物グループに知らせる(data_api, pushes):
+@pytest.fixture(autouse=True)
+def photo_s3(monkeypatch: pytest.MonkeyPatch) -> FakeS3:
+    """写真のコピーを偽物にする。CloudFront がある状態（URL が決まっている）にしておく。"""
+    fake = FakeS3()
+    monkeypatch.setattr(line_notify, "s3", fake)
+    monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BUCKET", WEB_BUCKET)
+    monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BASE_URL", PHOTO_BASE_URL)
+    return fake
+
+
+def test_確定すると落とし物グループに写真付きで知らせる(data_api, pushes, photo_s3):
     data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
 
     status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
 
     assert status == 200
-    # 値は人が確定したもの。拾得日時は UTC の 10/08 21:03 を日本時間（+9時間）にしたもの
+    # 原本（uploads/aeca10bb.jpg）を、web バケットの notify/<落とし物の ID>.jpg にコピーする
+    assert photo_s3.copies == [
+        {
+            "Bucket": WEB_BUCKET,
+            "Key": f"notify/{ITEM_ID}.jpg",
+            "CopySource": {"Bucket": BUCKET, "Key": "uploads/aeca10bb.jpg"},
+        }
+    ]
+    # 1回の push で、文字と写真の吹き出しを2つ送る。値は人が確定したもの
+    photo_url = f"{PHOTO_BASE_URL}/{ITEM_ID}.jpg"
     assert pushes == [
         (
             GROUP,
-            "落とし物のお知らせ\n種別：財布\n色：—\nブランド：—\n拾得日時：10/09 06:03\n拾得場所：—",
+            [
+                {"type": "text", "text": NOTIFICATION_TEXT},
+                {"type": "image", "originalContentUrl": photo_url, "previewImageUrl": photo_url},
+            ],
         )
     ]
 
 
+def test_CloudFrontが無ければ文字だけで知らせる(data_api, pushes, photo_s3, monkeypatch):
+    monkeypatch.setattr(line_notify, "NOTIFY_PHOTO_BASE_URL", "")
+    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
+
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+
+    assert status == 200
+    assert photo_s3.copies == []  # 開ける URL が無いので、コピーもしない
+    assert pushes == [(GROUP, [{"type": "text", "text": NOTIFICATION_TEXT}])]
+
+
+def test_写真のコピーに失敗しても文字だけで知らせる(data_api, pushes, photo_s3):
+    photo_s3.broken = True
+    data_api.answers = [rows(PENDING_ROW), updated(1), rows(CONFIRMED_ROW)]
+
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+
+    assert status == 200
+    assert pushes == [(GROUP, [{"type": "text", "text": NOTIFICATION_TEXT}])]
+
+
+def test_LINEで表示できない形式の写真は付けない(data_api, pushes, photo_s3):
+    webp_row = {**PENDING_ROW, "s3_key": "uploads/aeca10bb.webp"}  # LINE の画像は JPEG と PNG だけ
+    data_api.answers = [rows(webp_row), updated(1), rows(CONFIRMED_ROW)]
+
+    status, _, _ = call("POST", f"/items/{ITEM_ID}/confirm", claims=ADMIN, body=CONFIRMATION)
+
+    assert status == 200
+    assert photo_s3.copies == []
+    assert pushes == [(GROUP, [{"type": "text", "text": NOTIFICATION_TEXT}])]
+
+
 def test_知らせに失敗しても確定は成功のまま(data_api, monkeypatch):
-    def broken_push(to: str, text: str) -> None:
+    def broken_push(to: str, messages: list[dict[str, Any]]) -> None:
         raise OSError("LINE につながらない")
 
     monkeypatch.setattr(line_notify, "push", broken_push)

@@ -976,6 +976,12 @@ resource "aws_lambda_function" "api" {
       # 確定したら落とし物グループに LINE で知らせる（ステップ11。読む権限は line.tf の api_line_token）
       LINE_CHANNEL_ACCESS_TOKEN_ARN = aws_secretsmanager_secret.line_channel_access_token.arn
       LINE_GROUP_ID                 = var.line_group_id
+
+      # 知らせに付ける写真のコピーを置くバケット（NOTIFY_PHOTO_BUCKET）と、その写真の URL のうちファイル名より前の部分
+      # （NOTIFY_PHOTO_BASE_URL。例：https://xxxx.cloudfront.net/notify）。API が後ろに「/落とし物の ID.jpg」を付けて LINE に送る。
+      # 置く権限と30日で消す決まりは line.tf。enable_cloudfront = false（CloudFront を作らない設定）のときは空にし、文字だけで知らせる
+      NOTIFY_PHOTO_BUCKET   = aws_s3_bucket.web.bucket
+      NOTIFY_PHOTO_BASE_URL = var.enable_cloudfront ? "https://${aws_cloudfront_distribution.web[0].domain_name}/notify" : ""
     }
   }
 

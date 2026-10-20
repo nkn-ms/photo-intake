@@ -397,9 +397,16 @@ def confirm_item(
     detail = get_item(item_id)
 
     # 落とし物グループに LINE で知らせる。確定の書き込みが成功したときだけ、ここまで来る。
-    # 知らせに失敗しても、確定は成功のまま返す（line_notify.py）
+    # 知らせに失敗しても、確定は成功のまま返す（line_notify.py）。
+    # 写真の原本のキー（s3_key）は詳細（ItemDetail）に無いので、最初に読んだ行から渡す（確定で変わらない列）
     notify_line_group(
-        detail.category, detail.color, detail.brand, detail.registered_at, detail.location
+        detail.category,
+        detail.color,
+        detail.brand,
+        detail.registered_at,
+        detail.location,
+        item_id,
+        row["s3_key"],
     )
     return detail
 
