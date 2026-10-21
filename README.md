@@ -1,6 +1,7 @@
 # photo-intake
 
-**拾得物（落とし物）を写真で登録すると、AI が種別・色・ブランド・特徴を読み取って台帳にする、サーバーレスの管理システム。**
+**拾得物（落とし物）を写真で登録すると、AI が種別・色・ブランド・特徴を読み取って台帳にする、サーバーレスの管理システム。
+落とし主からの問い合わせも LINE で受け付ける。**
 
 AWS のインフラはすべて Terraform で作っている。
 
@@ -21,14 +22,17 @@ AWS のインフラはすべて Terraform で作っている。
    あわせて、**落とし物グループに LINE で写真付きの知らせが届く**（「落とし物のお知らせ／種別：財布…」と写真）
 5. **失敗しても業務は止まらない。** 解析が失敗した行は「解析失敗」になり、画面から人が手で入力して確定できる。
    一時的な失敗は3回までやり直し、それでも駄目ならアラームがメールで知らせる（[詳しく](#失敗したらどうなるか)）
+6. **落とし主が LINE で問い合わせる。** 問い合わせ用の LINE 公式アカウント（スタッフ用とは別）に文字で送ると、
+   受け付けて**受付番号（例：A-0012）だけ**を返す。スタッフは管理画面の「問い合わせ」の一覧で見る
+   （[詳しく](#落とし主には受付番号だけを返す)）
 
-まだ作っていないもの（落とし主の問い合わせ、ベクトル検索、CI）は [まだやっていないこと](#まだやっていないこと) に書いた。
+まだ作っていないもの（問い合わせのフォーム、問い合わせと拾得物の照らし合わせ、CI）は [まだやっていないこと](#まだやっていないこと) に書いた。
 
 ## 構成
 
 ![構成図](frontend/src/architecture.png)
 
-矢印の色：灰＝画面から・緑＝LINE から登録・青＝確定したら知らせる・赤＝失敗したとき。
+矢印の色：灰＝画面から・緑＝LINE から登録・青＝確定したら知らせる・紫＝落とし主の問い合わせ・赤＝失敗したとき。
 
 > 図は draw.io で描いている（`docs/architecture.drawio`）。`make diagram` で PNG に書き出し、README と画面の `/architecture` の両方で同じ画像を使う。
 
@@ -52,7 +56,7 @@ AWS のインフラはすべて Terraform で作っている。
 | DB | Aurora Serverless v2（PostgreSQL）を Data API で使う。使われないときは自動で止まる |
 | 非同期 | S3 イベント → SQS（+ DLQ）→ Lambda（worker）。二重実行は Powertools の `@idempotent_function` + DynamoDB で止める |
 | AI | Claude API（Haiku 5.5）を直接呼ぶ（本来は Bedrock。[理由](#今は代わりのものを使っているところ)） |
-| LINE | Messaging API。受け口は API Gateway → Lambda（line-webhook → line-intake）、知らせは API から push |
+| LINE | Messaging API。公式アカウントはスタッフ用と問い合わせ用の2つ。受け口はどちらも API Gateway → Lambda（受け口 → 処理の2つ）、確定の知らせは API から push |
 | IaC | Terraform |
 | テスト | pytest + moto（AWS に繋がずに動く）、mypy（strict）、ruff、Oxlint |
 
@@ -111,7 +115,23 @@ S3 のキーを LINE のメッセージ ID から決め、DB には `ON CONFLICT
 スタッフの ID の一覧は持たないので、人の出入りは LINE の中（グループに招待する・外す）で済む。
 
 受け口のコード（`backend/line/webhook.py`）は、署名を確かめる鍵と渡す先を環境変数で受け取る。
-公式アカウントを増やすとき（落とし主の問い合わせ用など）も、同じコードをもう1つ置けばよい。
+落とし主の問い合わせ用の公式アカウントには、同じコードをもう1つ置いている（line-inquiry-webhook → line-inquiry）。
+LINE の Webhook URL は公式アカウントごとに1つなので、API Gateway のルートも分ける（`POST /line/webhook` と `POST /line/inquiry/webhook`）。
+LINE の API の呼び出し・DB への SQL・鍵の読み込みは、処理をする2つの Lambda で共通なので `backend/line/line_common.py` にまとめた。
+
+### 落とし主には受付番号だけを返す
+問い合わせ用の公式アカウントは、スタッフ用とは分けている。お客さまにスタッフ用のメニューや落とし物グループを見せないため。
+
+- **お客さまに返すのは受付番号だけ。** 落とし物の ID・写真・候補は見せない。見せると、持ち主でない人が「それは私のです」と名乗れる。
+  照らし合わせはスタッフが確かめてから連絡する。落とし物の ID を見せないのは、知らせの写真の URL がその ID から作られているためでもある
+- **スタッフの落とし物グループには知らせない。** あのグループは社内の落とし物の情報を共有する場所で、お客さまの問い合わせは混ぜない。
+  問い合わせは管理画面の一覧（`GET /requests`）で見る。だから line-inquiry が読める鍵は**問い合わせ用のアクセストークン1つだけ**
+- **大量に送られても困らないようにする。** 1人あたり直近24時間に5件まで、1件500文字まで。超えた分は保存せず、そう返事するだけ。
+  件数は `(line_user_id, created_at)` の索引で数える
+- **送り直しで二重に受け付けない。** LINE のメッセージ ID を UNIQUE の列に入れ、`INSERT … ON CONFLICT DO NOTHING RETURNING receipt_no` で、
+  行と受付番号を1つにする。受付番号は DB の IDENTITY 列が振る
+- **受付番号は確実に届ける。** 返事（reply）は無料だが、届いたイベントのトークンで短い時間しか使えない。DB の起動待ちで1分後のやり直しになると
+  トークンが切れているので、そのときは push で送り直す
 
 ### 知らせの写真は、別のバケットと別のドメインから出す
 LINE の画像メッセージは、写真の URL を送り、LINE のサーバーがその URL から取りに行く。だから**ログインなしで開ける HTTPS の URL** が要る。
@@ -201,7 +221,9 @@ Terraform の state は**今はローカル**（`infra/envs/dev/terraform.tfstat
   HTTP（暗号化なし）のリクエストはバケットのポリシーで断る。LINE の知らせに出すのは、確定した写真のコピーだけ（30日・別のドメイン。[詳しく](#知らせの写真は別のバケットと別のドメインから出す)）
 - **S3 は直接公開しない。** 画面と知らせの写真も、S3 はパブリックアクセスを全部ブロックしたまま、CloudFront だけに読ませる（OAC）。
   CloudFront はセキュリティのヘッダー（`nosniff`、HSTS、`X-Frame-Options` など）を付けて返す
-- **LINE からのリクエストは、署名を確かめる。** 受け口は、LINE のチャネルシークレットで作った署名（HMAC-SHA256）が合わなければ 401 で断る
+- **LINE からのリクエストは、署名を確かめる。** 受け口は、LINE のチャネルシークレットで作った署名（HMAC-SHA256）が合わなければ 401 で断る。
+  公式アカウントごとに鍵が違い、それぞれの受け口が読めるのは自分のアカウントのチャネルシークレットだけ
+- **問い合わせには上限を付ける。** 1人あたり直近24時間に5件・1件500文字まで。お客さまに返すのは受付番号だけ（[詳しく](#落とし主には受付番号だけを返す)）
 - **撮影場所を残さない。** 写真の EXIF（位置情報など）は、送る前にブラウザの中で消す
 - **認証は API Gateway、認可は API。** ログインしているか（Cognito の JWT）は API Gateway が Lambda の手前で確かめる。
   admin だけの操作（確定）は API が確かめて 403 を返す。画面でボタンを隠すのは見た目の都合にすぎない
@@ -217,9 +239,9 @@ Terraform の state は**今はローカル**（`infra/envs/dev/terraform.tfstat
 
 | 状態 | かかるもの |
 |---|---|
-| 使っていない間 | Secrets Manager（3つで $1.20/月）・CloudWatch Alarm（$0.10/月）・Aurora のストレージ。Aurora は最後の SQL から5分で止まり、止まっている間の計算の料金はかからない |
+| 使っていない間 | Secrets Manager（5つで $2.00/月）・CloudWatch Alarm（$0.10/月）・Aurora のストレージ。Aurora は最後の SQL から5分で止まり、止まっている間の計算の料金はかからない |
 | 使っている間 | 上に加えて Aurora の稼働時間（0〜1 ACU）。Lambda・API Gateway・SQS・S3・DynamoDB・CloudFront は使った分だけで、この量ならほぼ $0 |
-| LINE | 無料のプランの中（push は月200通まで。受付の返事は reply なので数えない） |
+| LINE | 無料のプランの中（push は公式アカウントごとに月200通まで。受付の返事は reply なので数えない） |
 | AI | 写真1枚あたり約 $0.0004（実測：入力 2,553・出力 371 トークン、Haiku 5.5） |
 | `make destroy` 済み | **$0** |
 
@@ -232,7 +254,7 @@ Terraform の state は**今はローカル**（`infra/envs/dev/terraform.tfstat
 - Terraform 1.11 以上
 - AWS CLI v2。IAM Identity Center のプロファイルを `aws configure sso` で `photo-intake` という名前で作っておく（Makefile がこの名前を使う）
 - uv（Python の実行と依存の管理）、Node.js
-- LINE を使うなら、LINE Developers で Messaging API のチャネル（公式アカウント）を作っておく
+- LINE を使うなら、LINE Developers で Messaging API のチャネル（公式アカウント）を作っておく。問い合わせも受けるなら、もう1つ作る
 - 構成図を直すなら、draw.io のアプリ（`brew install --cask drawio`）
 
 初めて作るとき：
@@ -272,6 +294,20 @@ terraform -chdir=infra/envs/dev output line_webhook_url   # これを LINE Devel
 - 落とし物グループを LINE で作り、ボットを招待する。line-intake のログ（CloudWatch Logs）に出たグループの ID を、
   `terraform.tfvars` の `line_group_id` に書いて `make apply`。人がログから写して書くことが、「このグループを落とし物グループにしてよい」という承認になる
 
+問い合わせも受けるとき：
+
+```bash
+# 問い合わせ用の公式アカウントの鍵を2つ入れる（スタッフ用とは別の値）
+read -s KEY && AWS_PROFILE=photo-intake aws secretsmanager put-secret-value \
+  --secret-id photo-intake-dev/line-inquiry-channel-secret --secret-string "$KEY" && unset KEY
+read -s KEY && AWS_PROFILE=photo-intake aws secretsmanager put-secret-value \
+  --secret-id photo-intake-dev/line-inquiry-channel-access-token --secret-string "$KEY" && unset KEY
+
+terraform -chdir=infra/envs/dev output line_inquiry_webhook_url   # 問い合わせ用のチャネルの Webhook URL に入れて「検証」
+```
+
+- 問い合わせ用の公式アカウントでは、LINE が用意した自動の「応答メッセージ」を切り、グループへの参加を許可しない設定にする
+
 ふだん使うもの：
 
 ```bash
@@ -294,9 +330,10 @@ cd frontend && npx tsc -b && npx oxlint
 ```
 infra/envs/dev/      Terraform（root module。terraform はここで実行する）
 backend/
-├── api/             API の Lambda（FastAPI）。確定したら LINE で知らせる（line_notify.py）
+├── api/             API の Lambda（FastAPI）。確定したら LINE で知らせる（line_notify.py）。問い合わせの一覧（routers/requests.py）
 ├── worker/          解析の Lambda
-├── line/            LINE の Lambda（webhook.py：受け口、intake.py：写真を登録する）
+├── line/            LINE の Lambda（webhook.py：受け口・2つのアカウントで共通、intake.py：写真を登録する、
+│                    inquiry.py：問い合わせを受け付ける、line_common.py：intake と inquiry の共通の部品）
 ├── migrations/      DB の表（SQL）
 └── tests/           pytest + moto
 frontend/            画面（React）
@@ -311,9 +348,10 @@ docs/
 
 ## まだやっていないこと
 
-- **落とし主の問い合わせ：** 問い合わせ用の LINE 公式アカウントを足し、落とし主が文字で送った問い合わせを受け付けて受付番号を返す。
-  スタッフは管理画面と落とし物グループで見る。落とし主には、写真も候補も見せない（持ち主でない人が名乗り出るのを防ぐため）
-- **問い合わせとの照合：** 問い合わせの自由文と拾得物を埋め込み（ベクトル）にして、pgvector で近いものを探す。候補はスタッフが確かめてから連絡する
+- **問い合わせのフォーム（作業中）：** 今はトークの自由な文を受け付けるので、日時や場所が抜けていても受け付けてしまい、
+  管理画面からは「誰から」も分からない。LINE の中で開くフォーム（LIFF）にして、種類・色・特徴・落とした日・場所を全部埋めないと送れないようにする。
+  LIFF のログインで得た ID トークンを API が LINE に確かめてもらい、LINE の利用者 ID と表示名を問い合わせに付ける
+- **問い合わせとの照合：** 問い合わせと拾得物を埋め込み（ベクトル）にして、pgvector で近いものを探す。候補はスタッフが確かめてから連絡する
 - **CI：** GitHub Actions + OIDC（キーを持たない）。PR に `terraform plan` の結果を出し、merge で apply。その前に state を S3 に移す
 - **本来の形に戻す：** Bedrock（`analyzer = "bedrock"`）は、アカウントの制限が解けたら
 - **CSP**（上のセキュリティの節）

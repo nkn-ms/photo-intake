@@ -27,7 +27,7 @@ export default function ArchitecturePage() {
           />
         </Link>
         <Typography variant="body2" sx={{ mt: 1, color: 'text.secondary' }}>
-          矢印の色：灰＝画面から・緑＝LINE から登録・青＝確定したら知らせる・赤＝失敗したとき。図を押すと大きく開く
+          矢印の色：灰＝画面から・緑＝LINE から登録・青＝確定したら知らせる・紫＝落とし主の問い合わせ・赤＝失敗したとき。図を押すと大きく開く
         </Typography>
       </Paper>
 
