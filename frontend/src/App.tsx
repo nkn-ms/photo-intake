@@ -109,6 +109,9 @@ export default function App() {
               <Button color="inherit" component={NavLink} to="/items" sx={navSx}>
                 一覧
               </Button>
+              <Button color="inherit" component={NavLink} to="/requests" sx={navSx}>
+                問い合わせ
+              </Button>
             </>
           )}
           {/* 構成はログインしていなくても見られるので、メニューにいつも出す */}

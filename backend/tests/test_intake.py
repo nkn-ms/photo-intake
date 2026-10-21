@@ -2,6 +2,7 @@
 
 確かめること：イベントの振り分けと、写真を登録する手順（メンバーか → 取ってくる → 行を作る → 置く）。
 外とやりとりする部分（LINE の API・DB・S3）は、呼ばれた内容を覚えておくだけの偽物に差し替える。
+LINE の API と DB は line_common.py にあるので、line_common の関数を差し替える（intake.py はそれを呼んでいる）。
 """
 
 import io
@@ -12,6 +13,7 @@ from typing import Any
 import pytest
 
 import intake
+import line_common
 
 GROUP = "C" + "2" * 32
 MEMBER = "U" + "1" * 32
@@ -31,6 +33,7 @@ class FakeWorld:
 
     def __init__(self) -> None:
         self.requests: list[tuple[str, str]] = []  # LINE に送ったリクエスト（メソッド, URL）
+        self.token_arns: set[str] = set()  # LINE を呼ぶのに使った鍵の場所
         self.replies: list[dict] = []  # LINE に送った返事の本文
         self.reply_status = (
             200  # 返事を送ったときに LINE が返す番号（トークン切れを試すときに変える）
@@ -41,7 +44,10 @@ class FakeWorld:
         self.photo = FakeResponse(b"jpeg-bytes", "image/jpeg")  # LINE から取ってくる写真
         self.member_api_status = 200  # メンバーのときに LINE が返す番号（不調を試すときに変える）
 
-    def line_request(self, method: str, url: str, body: dict | None = None) -> FakeResponse:
+    def line_request(
+        self, token_arn: str, method: str, url: str, body: dict | None = None
+    ) -> FakeResponse:
+        self.token_arns.add(token_arn)
         self.requests.append((method, url))
         if url.endswith("/message/reply"):
             self.replies.append(body or {})
@@ -70,8 +76,8 @@ class FakeWorld:
 def world(monkeypatch: pytest.MonkeyPatch) -> FakeWorld:
     """どのテストでも、LINE・DB・S3 には繋がない。落とし物グループは GROUP に決まっている状態にする。"""
     fake = FakeWorld()
-    monkeypatch.setattr(intake, "line_request", fake.line_request)
-    monkeypatch.setattr(intake, "execute_sql", fake.execute_sql)
+    monkeypatch.setattr(line_common, "line_request", fake.line_request)
+    monkeypatch.setattr(line_common, "execute_sql", fake.execute_sql)
     monkeypatch.setattr(intake, "put_photo", fake.put_photo)
     monkeypatch.setattr(intake, "LINE_GROUP_ID", GROUP)
     return fake
@@ -115,6 +121,8 @@ def test_メンバーの写真は行を作ってS3に置く(world: FakeWorld) ->
             "messages": [{"type": "text", "text": intake.RECEIVED_MESSAGE}],
         }
     ]
+    # メンバーの確認・写真の取得・返事のどれも、スタッフ用アカウントの鍵で呼ぶ
+    assert world.token_arns == {intake.LINE_CHANNEL_ACCESS_TOKEN_ARN}
 
 
 def test_返事に失敗しても登録は続ける(world: FakeWorld) -> None:
@@ -164,12 +172,14 @@ def test_読めない形式の写真は登録しない(world: FakeWorld) -> None
 
 def test_写真の取得より先に行を作らない(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
     # 写真を取ってこられなかったら、写真の無い行を残さない
-    def broken_line_request(method: str, url: str, body: dict | None = None) -> FakeResponse:
+    def broken_line_request(
+        token_arn: str, method: str, url: str, body: dict | None = None
+    ) -> FakeResponse:
         if url.endswith("/content"):
             raise urllib.error.URLError("timeout")
         return FakeResponse()
 
-    monkeypatch.setattr(intake, "line_request", broken_line_request)
+    monkeypatch.setattr(line_common, "line_request", broken_line_request)
     with pytest.raises(urllib.error.URLError):
         intake.handler(photo_event(), None)
     assert world.sql == []

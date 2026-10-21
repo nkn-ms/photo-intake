@@ -89,6 +89,22 @@ export function listItems(status?: ItemStatus): Promise<ItemSummary[]> {
   return request<ItemSummary[]>('GET', `/items?${query}`)
 }
 
+/**
+ * GET /requests の1件分（API の routers/requests.py の RequestSummary と同じ形）。落とし主からの問い合わせ。
+ * LINE のユーザー ID は API が返さない（画面では使わない）。
+ */
+export interface RequestSummary {
+  id: string
+  receipt: string // 受付番号（'A-0012' の形）。お客さまに LINE で伝えた番号と同じ
+  description: string // お客さまが送った本文
+  created_at: string // 受け付けた日時（UTC）
+}
+
+/** 問い合わせの一覧を、受け付けた日時の新しい順に50件読む。 */
+export function listRequests(): Promise<RequestSummary[]> {
+  return request<RequestSummary[]>('GET', '/requests')
+}
+
 /** GET /items/{id} と確定の返り値（API の ItemDetail と同じ形）。AI の答えと人の値を分けたまま持つ。 */
 export interface ItemDetail {
   id: string

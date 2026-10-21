@@ -1,4 +1,4 @@
-"""API（app.py・auth.py・db.py・routers/items.py）の分かれ道を、AWS に繋がずに確かめる。
+"""API（app.py・auth.py・db.py・routers/items.py・routers/requests.py）の分かれ道を、AWS に繋がずに確かめる。
 
 ■ 呼び方
   Lambda に届くのと同じ形の event（API Gateway HTTP API・payload 2.0）を作って、app.handler に渡す。
@@ -28,7 +28,9 @@ from conftest import BUCKET
 
 import app
 import db
+import inquiry
 import line_notify
+from routers import requests
 
 # --- JWT の中身（API Gateway が確かめ済みのもの）---
 
@@ -357,6 +359,51 @@ def test_種別が空なら422でDBに触らない(data_api):
 
 
 # ===========================================================================
+# 問い合わせの一覧：GET /requests
+# ===========================================================================
+
+REQUEST_ID = "7b1f0c2e-5d3a-4e8b-9f61-2a4c8d0e1b35"
+
+
+def test_問い合わせの一覧は受付番号をお客さまに見せた形で返す(data_api):
+    data_api.answers = [
+        rows(
+            {
+                "id": REQUEST_ID,
+                "receipt_no": 12,
+                "description": "黒い革の財布を、3番線のホームで落としました",
+                "created_at": "2026-10-21 03:15:42.123456",
+            }
+        )
+    ]
+
+    status, body, _ = call("GET", "/requests", claims=STAFF)
+
+    assert status == 200
+    assert body == [
+        {
+            "id": REQUEST_ID,
+            "receipt": "A-0012",
+            "description": "黒い革の財布を、3番線のホームで落としました",
+            "created_at": "2026-10-21T03:15:42.123456Z",  # UTC の印 Z が付く
+        }
+    ]
+    assert "line_user_id" not in data_api.calls[0]["sql"]  # LINE のユーザー ID は読みもしない
+
+
+def test_問い合わせの一覧はトークンが無ければ401でDBに触らない(data_api):
+    status, _, _ = call("GET", "/requests")
+    assert status == 401
+    assert data_api.calls == []
+
+
+@pytest.mark.parametrize("receipt_no", [1, 12, 9999, 12345])
+def test_受付番号の形はLINEの返事と画面で同じ(receipt_no):
+    # API（routers/requests.py）と line-inquiry（line/inquiry.py）は別の zip なので、同じ1行を別々に持っている
+    assert requests.format_receipt(receipt_no) == inquiry.format_receipt(receipt_no)
+
+
+# ===========================================================================
 # DB が起動中（db.py は待たずに例外を投げ、app.py の例外ハンドラーが 503 にする）
 # ===========================================================================
 
@@ -367,6 +414,7 @@ def test_種別が空なら422でDBに触らない(data_api):
         ("POST", "/items", {"content_type": "image/jpeg"}),
         ("GET", "/items", None),
         ("GET", f"/items/{ITEM_ID}", None),
+        ("GET", "/requests", None),
     ],
 )
 def test_DBが起動中ならどのルートでも送り直さずに503とRetryAfter(data_api, method, path, body):

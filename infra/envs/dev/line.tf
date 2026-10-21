@@ -28,6 +28,8 @@
 # main.tf とは別のファイルにしているが、Terraform は同じフォルダの .tf をすべてまとめて読むので、
 # main.tf の中に書いたのと同じ扱いになる（aws_apigatewayv2_api.main などをそのまま参照できる）。
 # LINE の部分だけを1か所で読めるように分けた。
+#
+# このファイルはスタッフ用の公式アカウント。落とし主からの問い合わせを受ける公式アカウントは line_inquiry.tf。
 
 # ---------------------------------------------------------------------------
 # LINE の鍵の置き場所（Secrets Manager）
@@ -222,10 +224,22 @@ resource "aws_iam_role_policy" "line_intake_s3" {
   })
 }
 
+# intake.py と、問い合わせ用（line_inquiry.tf）と共通の line_common.py の2ファイルを zip にする。
+# source ブロックは、zip の中の1ファイル分（content が中身、filename が zip の中での名前）。
+# どちらも zip の一番上に置くので、intake.py の import line_common がそのまま通る
 data "archive_file" "line_intake" {
   type        = "zip"
-  source_file = "${path.module}/../../../backend/line/intake.py"
   output_path = "${path.module}/.build/line-intake.zip"
+
+  source {
+    content  = file("${path.module}/../../../backend/line/intake.py")
+    filename = "intake.py"
+  }
+
+  source {
+    content  = file("${path.module}/../../../backend/line/line_common.py")
+    filename = "line_common.py"
+  }
 }
 
 resource "aws_cloudwatch_log_group" "line_intake" {

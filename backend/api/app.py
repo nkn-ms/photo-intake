@@ -5,6 +5,7 @@
   auth.py          … 認証。JWT の中身からリクエストしてきた人を作る
   db.py            … SQL を送る共通の処理（Data API）
   routers/items.py … /items のルート
+  routers/requests.py … /requests のルート（落とし主からの問い合わせ）
 
 ■ Mangum
   Lambda に届く event（dict）を、FastAPI が分かる HTTP のリクエストに変換するアダプタ。
@@ -28,10 +29,11 @@ from mangum import Mangum
 
 from auth import User, get_current_user
 from db import DatabaseResumingError
-from routers import items
+from routers import items, requests
 
 app = FastAPI(title="photo-intake API")
 app.include_router(items.router)
+app.include_router(requests.router)
 
 
 # 例外ハンドラー：どのルートで DatabaseResumingError が投げられても、ここで受け取って 503 にする。

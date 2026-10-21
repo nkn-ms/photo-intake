@@ -47,6 +47,10 @@ os.environ["FORWARD_FUNCTION_NAME"] = "test-line-intake"
 os.environ["LINE_CHANNEL_ACCESS_TOKEN_ARN"] = (
     "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:token"
 )
+# line-inquiry（line/inquiry.py）が読む。問い合わせ用アカウントの鍵の場所（値は使わない）
+os.environ["LINE_INQUIRY_ACCESS_TOKEN_ARN"] = (
+    "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:inquiry-token"
+)
 
 
 # --- 2. moto（偽の AWS）---
